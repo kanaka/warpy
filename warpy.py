@@ -7,6 +7,7 @@ if IS_RPYTHON:
     from rpython.rtyper.lltypesystem import lltype
     from rpython.rtyper.lltypesystem.lloperation import llop
     from rpython.rlib.listsort import TimSort
+    from rpython.rlib.rstruct.ieee import float_unpack
 
     class IntSort(TimSort):
         def lt(self, a, b):
@@ -16,12 +17,24 @@ if IS_RPYTHON:
 
     def do_sort(a):
         IntSort(a).sort()
+
+    def unpack_f32(i32):
+        return float_unpack(i32, 4)
+    def unpack_f64(i64):
+        return float_unpack(i64, 8)
+
 else:
     sys.path.append(os.path.abspath('./pypy2-v5.6.0-src'))
     import traceback
+    import struct
 
     def do_sort(a):
         a.sort()
+
+    def unpack_f32(i32):
+        return struct.unpack('f', struct.pack('I', i32))[0]
+    def unpack_f64(i64):
+        return struct.unpack('d', struct.pack('q', i64))[0]
 
 # TODO: do we need to track the stack size at each block/call and
 # discard extras from the stack?
@@ -123,13 +136,6 @@ SECTION_NAMES = { 0  : 'Custom',
                   10 : 'Code',
                   11 : 'Data' }
 
-OPERATIONS = { 0x40: ("i32.add", lambda a,b: I32(int(a.val + b.val))),
-               0x41: ("i32.sub", lambda a,b: I32(int(a.val - b.val))),
-               0x42: ("i32.mul", lambda a,b: I32(int(a.val * b.val))),
-               0x4d: ("i32.eq",  lambda a,b: I32(int(a.val == b.val))),
-               0x4e: ("i32.ne",  lambda a,b: I32(int(a.val != b.val))),
-             }
-
 
 class Code():
     pass
@@ -190,8 +196,13 @@ class Export():
 
 ###
 
-def bytes2word(w):
-    return (w[3]<<24) + (w[2]<<16) + (w[1]<<8) + w[0]
+def bytes2uint32(b):
+    return ((b[3]<<24) + (b[2]<<16) + (b[1]<<8) + b[0])
+
+def bytes2uint64(b):
+    return ((b[7]<<56) + (b[6]<<48) + (b[5]<<40) + (b[4]<<32) +
+            (b[3]<<24) + (b[2]<<16) + (b[1]<<8) + b[0])
+
 
 class Reader():
     def __init__(self, bytes):
@@ -204,15 +215,28 @@ class Reader():
         return b
 
     def read_word(self):
-        w = bytes2word(self.bytes[self.pos:self.pos+4])
+        w = bytes2uint32(self.bytes[self.pos:self.pos+4])
         self.pos += 4
         return w
 
     def read_bytes(self, cnt):
         assert cnt > 0
+        assert self.pos >= 0
         bytes = self.bytes[self.pos:self.pos+cnt]
         self.pos += cnt
         return bytes
+
+    def read_F32(self):
+        bytes = self.read_bytes(4)
+        bits = bytes2uint32(bytes)
+        #print("read_F32 bytes: %s, bits: %d" % (bytes, bits))
+        return unpack_f32(bits)
+
+    def read_F64(self):
+        bytes = self.read_bytes(8)
+        bits = bytes2uint64(bytes)
+        #print("read_F64 bytes: %s, bits: %d" % (bytes, bits))
+        return unpack_f64(bits)
 
     # https://en.wikipedia.org/wiki/LEB128
     def read_LEB(self, maxbits=32, signed=False):
@@ -284,28 +308,32 @@ def byte_code_repr(bytes):
     return "[" + ",".join(res) + "]"
 
 def drop_immediates(rdr, opcode):
-    if 0x01 <= opcode <= 0x03:
+    if 0x01 <= opcode <= 0x03:  # blook/loop/if
         rdr.read_LEB(32) # block_type
-    elif 0x06 <= opcode <= 0x07:
+    elif 0x06 <= opcode <= 0x07:  # br/br_if
         rdr.read_LEB(32) # relative_depth
-    elif 0x08 == opcode:
+    elif 0x08 == opcode:  # br_table
         count = rdr.read_LEB(32) # target_count
         for i in range(count):
             rdr.read_LEB(32)  # br_table targets
         rdr.read_LEB(32) # default taget
-    elif 0x10 == opcode:
+    elif 0x10 == opcode:  # i32.const
         rdr.read_LEB(32, signed=True) # varint32
-    elif 0x11 == opcode:
+    elif 0x11 == opcode:  # i64.const
         rdr.read_LEB(64, signed=True) # varint64
-    elif 0x12 == opcode:
+    elif 0x12 == opcode:  # f64.const
         rdr.read_bytes(8) # uint64
-    elif 0x13 == opcode:
+    elif 0x13 == opcode:  # f32.const
         rdr.read_bytes(4) # uint32
-    elif 0x14 <= opcode <= 0x17:
+    elif 0x14 <= opcode <= 0x17:  # get_local/set_local/call/call_indirect
+        rdr.read_LEB(32) # index
+    elif 0x19 == opcode:  # tee_local
         rdr.read_LEB(32) # index
     elif 0x20 <= opcode <= 0x36:
         rdr.read_LEB(32) # memory_immediate flags
         rdr.read_LEB(32) # memory_immediate offset
+    elif 0xbb <= opcode <= 0xbc:  # get_global/set_global
+        rdr.read_LEB(32) # memory_immediate flags
 
 
 class Module():
@@ -391,7 +419,7 @@ class Module():
                 print("  %d [type: %d, import: '%s.%s']" % (
                     i, f.type.index, f.module, f.field))
             else:
-                print("  %d [type: %d, locals: %s, start: %d, end: %d]" % (
+                print("  %d [type: %d, locals: %s, start: 0x%x, end: 0x%x]" % (
                     i, f.type.index, [p.TYPE_NAME for p in f.locals],
                     f.start, f.end))
 
@@ -539,8 +567,9 @@ class Module():
                 locals.append(VALUE_TYPE[type])
         # TODO: simplify this calculation and find_blocks
         start = self.rdr.pos
-        self.rdr.read_bytes(body_size - (self.rdr.pos-payload_start))
+        self.rdr.read_bytes(body_size - (self.rdr.pos-payload_start)-1)
         end = self.rdr.pos
+        self.rdr.read_bytes(1)
         func = self.function[idx]
         assert isinstance(func,Function)
         func.update(locals, start, end)
@@ -559,7 +588,7 @@ class Module():
 
     def find_blocks(self, func, start, end):
         #print("bytes: %s" % bytes)
-        #print("start: %d, end: %d" % (start, end))
+        #print("start: 0x%x, end: 0x%x" % (start, end))
         # TODO: remove extra reader
         rdr = Reader(self.rdr.bytes)
         rdr.pos = start
@@ -568,16 +597,17 @@ class Module():
         block_start_map = {}
         block_end_map = {}
         # stack of blocks with current at top: (opcode, pos) tuples
-        opstack = [(-1, BLOCK_TYPE[0], start)]  # implicit function block
+        #opstack = [(-1, BLOCK_TYPE[0], start)]  # implicit function block
+        opstack = []  # implicit function block
 
         #
         # Build the map of blocks
         #
         opcode = 0
-        while rdr.pos < end:
+        while rdr.pos <= end:
             pos = rdr.pos
             opcode = rdr.read_byte()
-            #print("%d: opcode 0x%x, opstack: %s" % (pos, opcode, opstack))
+            #print("0x%x: opcode 0x%x, opstack: %s" % (pos, opcode, opstack))
             if   0x01 <= opcode <= 0x03:  # block, loop, if
                 block_sig = BLOCK_TYPE[rdr.read_byte()]
                 opstack.append((opcode, block_sig, pos))
@@ -588,11 +618,12 @@ class Module():
                 block_end_map[pos] = True
                 opstack.append((opcode, block_sig, pos))
             elif 0x0f == opcode:  # end
+                if pos == end: break
                 block_opcode, block_sig, block_start = opstack.pop()
                 block_start_map[block_start] = (block_opcode, block_sig, pos)
                 block_end_map[pos] = True
-
-            drop_immediates(rdr, opcode)
+            else:
+                drop_immediates(rdr, opcode)
 
         assert opcode == 0xf, "function block did not end with 0xf"
 
@@ -634,6 +665,8 @@ class Module():
                     target_count = rdr.read_LEB(32)+1 # +1 to catch default
                 for c in range(target_count):
                     relative_depth = rdr.read_LEB(32)
+                    print("0x%x: branch opcode 0x%x, depth: %d" % (
+                        pos, opcode, relative_depth))
                     block = blockstack[-1-relative_depth]
                     self.branch_map[pos] = block
                 continue # already skipped immediate
@@ -648,7 +681,7 @@ class Module():
     # TODO: update for MVP
     def run_code_v12(self):
         while not self.rdr.eof():
-            #self.dump_stacks()
+            self.dump_stacks()
             cur_pos = self.rdr.pos
             opcode = self.rdr.read_byte()
             print "    [0x%x op 0x%x] -" % (cur_pos, opcode),
@@ -661,7 +694,6 @@ class Module():
                 self.sigstack.append(block)
                 print("block sig: %s at 0x%x" % (
                     sig_repr(block), cur_pos))
-                raise Exception("block unimplemented")
             elif 0x02 == opcode:  # loop
                 self.rdr.read_LEB(32) # ignore block_type
                 block = self.block_map[cur_pos]
@@ -686,36 +718,37 @@ class Module():
                         # branch to after end of if
                         self.rdr.pos = block.label_addr
                 print("if cond: %s, sig: %s at 0x%x" % (
-                    cond.val, sig_repr(block), cur_pos))
+                    value_repr(cond), sig_repr(block), cur_pos))
             # NOTE: See end (0x07) for else (0x04)
             elif 0x05 == opcode:  # select
                 raise Exception("select unimplemented")
             elif 0x06 == opcode:  # br
                 relative_depth = self.rdr.read_LEB(32)
-                assert len(self.sigstack) > 0
-                block = self.sigstack.pop() # Always get at least one
-                for r in range(relative_depth+1):
-                    local_cnt = len(block.type.params) + len(block.locals)
-                    for i in range(local_cnt):
-                        self.localstack.pop()
-                    if r < relative_depth:
-                        block = self.sigstack.pop()
-                    # TODO: return values/normal stack?
-                if isinstance(block, Block):
-                    self.rdr.pos = block.label_addr
-                else:
-                    #self.rdr.pos = block.label_addr
-                    raise Exception("br from function unimplemented")
+                self.do_branch(relative_depth)
                 print("br depth: 0x%x, to: 0x%x" % (
                     relative_depth, self.rdr.pos))
             elif 0x07 == opcode:  # br_if
                 relative_depth = self.rdr.read_LEB(32)
-                print("br_if depth: 0x%x" % relative_depth)
-                raise Exception("br_if unimplemented")
+                cond = self.stack.pop()
+                if cond.val:
+                    self.do_branch(relative_depth)
+                print("br_if cond: %s, depth: 0x%x" % (
+                    value_repr(cond), relative_depth))
             elif 0x08 == opcode:  # br_table
                 raise Exception("br_table unimplemented")
             elif 0x09 == opcode:  # return
-                raise Exception("return unimplemented")
+                # Pop blocks until reach Function signature
+                while len(self.sigstack) > 0:
+                    if isinstance(self.sigstack[-1], Function): break
+                    block = self.sigstack.pop()
+                    local_cnt = len(block.type.params) + len(block.locals)
+                    for i in range(local_cnt):
+                        self.localstack.pop()
+                assert len(self.sigstack) > 0
+                block = self.sigstack[-1]
+                assert isinstance(block, Function)
+                # Set instruction pointer to end of function
+                self.rdr.pos = block.label_addr
             elif 0x0a == opcode:  # nop
                 pass
             elif 0x0b == opcode:  # drop
@@ -766,12 +799,12 @@ class Module():
             elif 0x11 == opcode:  # i64.const
                 self.stack.append(I64(int(self.rdr.read_LEB(64, signed=True))))
                 print("i64.const: %s" % value_repr(self.stack[-1]))
-            elif 0x12 == opcode:  # f32.const
-                self.stack.append(F32(float(self.rdr.read_LEB(32, signed=True))))
-                print("f32.const: %s" % value_repr(self.stack[-1]))
-            elif 0x13 == opcode:  # f64.const
-                self.stack.append(F64(float(self.rdr.read_LEB(64, signed=True))))
+            elif 0x12 == opcode:  # f64.const
+                self.stack.append(F64(self.rdr.read_F64()))
                 print("f64.const: %s" % value_repr(self.stack[-1]))
+            elif 0x13 == opcode:  # f32.const
+                self.stack.append(F32(self.rdr.read_F32()))
+                print("f32.const: %s" % value_repr(self.stack[-1]))
             elif 0x14 == opcode:  # get_local
                 arg = self.rdr.read_LEB(32)
                 print("get_local: 0x%x" % arg)
@@ -836,23 +869,112 @@ class Module():
 
             # Simple operations
 
+#            # i32 operations
+#            elif 0x40 <= opcode <= 0x5a or opcode in [0xb6, 0xb7]:
+#                b, a = self.stack.pop(), self.stack.pop()
+#                # TODO: add/use operation types, combine all ops
+#                # sections
+#                assert isinstance(a, I32)
+#                assert isinstance(b, I32)
+#                res = OPERATIONS_2[opcode][1](a,b)
+#                print("i32 op: %s(%s, %s) = %s" % (
+#                    OPERATIONS_2[opcode][0], value_repr(a),
+#                    value_repr(b), value_repr(res)))
+#                self.stack.append(res)
+
             # i32 operations
-            elif 0x40 <= opcode <= 0x5a or opcode in [0xb6, 0xb7]:
-                a = self.stack.pop()
-                b = self.stack.pop()
-                # TODO: add/use operation types, combine all ops
-                # sections
-                assert isinstance(a, I32)
-                assert isinstance(b, I32)
-                res = OPERATIONS[opcode][1](a,b)
-                print("i32 op: %s(%s, %s) = %s" % (
-                    OPERATIONS[opcode][0], value_repr(a),
-                    value_repr(b), value_repr(res)))
+            elif 0x40 == opcode: # i32.add
+                b, a = self.stack.pop(), self.stack.pop()
+                assert isinstance(a, I32) and isinstance(b, I32)
+                res = I32(int(a.val + b.val))
+                print("i32.add(%s, %s) = %s" % (
+                    value_repr(a), value_repr(b), value_repr(res)))
+                self.stack.append(res)
+            elif 0x41 == opcode: # i32.sub
+                b, a = self.stack.pop(), self.stack.pop()
+                assert isinstance(a, I32) and isinstance(b, I32)
+                res = I32(int(a.val - b.val))
+                print("i32.sub(%s, %s) = %s" % (
+                    value_repr(a), value_repr(b), value_repr(res)))
+                self.stack.append(res)
+            elif 0x42 == opcode: # i32.mul
+                b, a = self.stack.pop(), self.stack.pop()
+                assert isinstance(a, I32) and isinstance(b, I32)
+                res = I32(int(a.val * b.val))
+                print("i32.mul(%s, %s) = %s" % (
+                    value_repr(a), value_repr(b), value_repr(res)))
+                self.stack.append(res)
+            elif 0x4d == opcode: # i32.eq
+                b, a = self.stack.pop(), self.stack.pop()
+                assert isinstance(a, I32) and isinstance(b, I32)
+                res = I32(int(a.val == b.val))
+                print("i32.eq(%s, %s) = %s" % (
+                    value_repr(a), value_repr(b), value_repr(res)))
+                self.stack.append(res)
+            elif 0x4e == opcode: # i32.ne
+                b, a = self.stack.pop(), self.stack.pop()
+                assert isinstance(a, I32) and isinstance(b, I32)
+                res = I32(int(a.val != b.val))
+                print("i32.ne(%s, %s) = %s" % (
+                    value_repr(a), value_repr(b), value_repr(res)))
+                self.stack.append(res)
+            elif 0x4f == opcode: # i32.lt_s
+                b, a = self.stack.pop(), self.stack.pop()
+                assert isinstance(a, I32) and isinstance(b, I32)
+                res = I32(int(a.val < b.val))
+                print("i32.lt_s(%s, %s) = %s" % (
+                    value_repr(a), value_repr(b), value_repr(res)))
                 self.stack.append(res)
 
+#            # i64 operations
+#            elif 0x5b <= opcode <= 0x74 or opcode in [0xb8, 0xb9, 0xba]:
+#                b, a = self.stack.pop(), self.stack.pop()
+#                # TODO: add/use operation types, combine all ops
+#                # sections
+#                assert isinstance(a, I64)
+#                assert isinstance(b, I64)
+#                res = OPERATIONS_2[opcode][1](a,b)
+#                print("i64 op: %s(%s, %s) = %s" % (
+#                    OPERATIONS_2[opcode][0], value_repr(a),
+#                    value_repr(b), value_repr(res)))
+#                self.stack.append(res)
+
             # i64 operations
-            elif 0x5b <= opcode <= 0x74 or opcode in [0xb8, 0xb9, 0xba]:
-                raise Exception("i64 ops unimplemented")
+            elif 0x5b == opcode: # i64.add
+                b, a = self.stack.pop(), self.stack.pop()
+                assert isinstance(a, I64) and isinstance(b, I64)
+                res = I64(int(a.val + b.val))
+                print("i64.add(%s, %s) = %s" % (
+                    value_repr(a), value_repr(b), value_repr(res)))
+                self.stack.append(res)
+            elif 0x5c == opcode: # i64.sub
+                b, a = self.stack.pop(), self.stack.pop()
+                assert isinstance(a, I64) and isinstance(b, I64)
+                res = I64(int(a.val - b.val))
+                print("i64.sub(%s, %s) = %s" % (
+                    value_repr(a), value_repr(b), value_repr(res)))
+                self.stack.append(res)
+            elif 0x5d == opcode: # i64.mul
+                b, a = self.stack.pop(), self.stack.pop()
+                assert isinstance(a, I64) and isinstance(b, I64)
+                res = I64(int(a.val * b.val))
+                print("i64.mul(%s, %s) = %s" % (
+                    value_repr(a), value_repr(b), value_repr(res)))
+                self.stack.append(res)
+            elif 0x5e == opcode: # i64.div_s
+                b, a = self.stack.pop(), self.stack.pop()
+                assert isinstance(a, I64) and isinstance(b, I64)
+                res = I64(int(a.val / b.val))
+                print("i64.div_s(%s, %s) = %s" % (
+                    value_repr(a), value_repr(b), value_repr(res)))
+                self.stack.append(res)
+            elif 0x6e == opcode: # i64.gt_s
+                b, a = self.stack.pop(), self.stack.pop()
+                assert isinstance(a, I64) and isinstance(b, I64)
+                res = I32(int(a.val > b.val))
+                print("i64.div_s(%s, %s) = %s" % (
+                    value_repr(a), value_repr(b), value_repr(res)))
+                self.stack.append(res)
 
             # f32 operations
             elif 0x75 <= opcode <= 0x88:
@@ -862,9 +984,50 @@ class Module():
             elif 0x89 <= opcode <= 0x9c:
                 raise Exception("f64 ops unimplemented")
 
+#            # conversion operations
+#            elif 0x9d <= opcode <= 0xb5:
+#                a = self.stack.pop()
+#                #assert isinstance(a, I32)
+#                res = OPERATIONS_1[opcode][1](a)
+#                print("conv op: %s(%s) = %s" % (
+#                    OPERATIONS_1[opcode][0], value_repr(a),
+#                    value_repr(res)))
+#                self.stack.append(res)
+
             # conversion operations
-            elif 0x9d <= opcode <= 0xb5:
-                raise Exception("conversion ops unimplemented")
+            elif 0xa6 == opcode: # i64.extend_s/i32
+                a = self.stack.pop()
+                assert isinstance(a, I32)
+                res = I64(int(a.val))
+                print("i64.extend_s/i32(%s) = %s" % (
+                    value_repr(a), value_repr(res)))
+                self.stack.append(res)
+            elif 0xb0 == opcode: # f64.convert_s/i64
+                a = self.stack.pop()
+                assert isinstance(a, I64)
+                res = F64(float(a.val))
+                print("f64.convert_s/i64(%s) = %s" % (
+                    value_repr(a), value_repr(res)))
+                self.stack.append(res)
+
+            else:
+                raise Exception("unrecognized opcode %d" % opcode)
+
+    def do_branch(self, depth):
+        assert len(self.sigstack) > 0
+        block = self.sigstack.pop() # Always get at least one
+        for r in range(depth+1):
+            local_cnt = len(block.type.params) + len(block.locals)
+            for i in range(local_cnt):
+                self.localstack.pop()
+            if r < depth:
+                block = self.sigstack.pop()
+            # TODO: return values/normal stack?
+        if isinstance(block, Block):
+            self.rdr.pos = block.label_addr
+        else:
+            #self.rdr.pos = block.label_addr
+            raise Exception("br* in function unimplemented")
 
     def call_setup(self, fidx, args):
         func = self.function[fidx]
@@ -879,7 +1042,7 @@ class Module():
         # Update the pos/instruction counter to the function
         self.rdr.pos = func.start
 
-        print("  Calling function %d, start: %d, end: %d, %d locals, %d params, %d results" % (
+        print("  Calling function %d, start: 0x%x, end: 0x%x, %d locals, %d params, %d results" % (
             fidx, func.start, func.end,
             len(func.locals), len(t.params), len(t.results)))
         print("    bytes: %s" % (
