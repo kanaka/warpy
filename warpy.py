@@ -359,6 +359,7 @@ class Module():
         print("branch_map: %s" % (
             ["0x%x->0x%x" % (k, br[k].start)
              for k in branch_keys]))
+        print("")
 
         print("Types:")
         for i, t in enumerate(self.type):
@@ -417,7 +418,7 @@ class Module():
     def read_section(self):
         id = self.rdr.read_LEB(7)
         name = SECTION_NAMES[id]
-        length = self.rdr.read_LEB(32) 
+        length = self.rdr.read_LEB(32)
         if   "Type" == name:     self.parse_Type(length)
         elif "Import" == name:   self.parse_Import(length)
         elif "Function" == name: self.parse_Function(length)
@@ -451,7 +452,7 @@ class Module():
                 results.append(VALUE_TYPE[self.rdr.read_LEB(32)])
             tidx = len(self.type)
             self.type.append(Type(tidx, form, params, results))
-        
+
 
     def parse_Import(self, length):
         count = self.rdr.read_LEB(32)
@@ -804,7 +805,7 @@ class Module():
                     if PType.TYPE_NAME != arg.TYPE_NAME:
                         raise Exception("call signature mismatch")
                     args.append(arg)
-                
+
                 if isinstance(func, FunctionImport):
                     print("call: %s.%s(%s)" % (
                         func.module, func.field,
@@ -832,7 +833,7 @@ class Module():
                 raise Exception("current_memory unimplemented")
             elif 0x39 == opcode:  # grow_memory
                 raise Exception("grow_memory unimplemented")
-            
+
             # Simple operations
 
             # i32 operations
@@ -864,7 +865,7 @@ class Module():
             # conversion operations
             elif 0x9d <= opcode <= 0xb5:
                 raise Exception("conversion ops unimplemented")
-        
+
     def call_setup(self, fidx, args):
         func = self.function[fidx]
 
@@ -917,14 +918,14 @@ class Module():
         self.returnstack = []
         self.sigstack = []
 
-        args = []
+        fargs = []
         for arg in args:
             # TODO: accept other argument types
             assert isinstance(arg, str)
-            args.append(I32(int(arg)))
+            fargs.append(I32(int(arg)))
 
         fidx = self.export_map[name].index
-        self.call_setup(fidx, args)
+        self.call_setup(fidx, fargs)
 
         print("Running function %s (%d)" % (name, fidx))
         return self.run_code_v12()
@@ -983,9 +984,20 @@ def entry_point(argv):
                 return [I32(int(res))]
 
 
+        # Argument handling
         wasm = open(argv[1]).read()
-        m = Module(wasm, call_import)
 
+        entry = "main"
+        if len(argv) >= 3:
+            entry = argv[2]
+
+        args = []
+        if len(argv) >= 4:
+            args = argv[3:]
+
+        #
+
+        m = Module(wasm, call_import)
         m.read_magic()
         m.read_version()
         m.read_sections()
@@ -993,21 +1005,11 @@ def entry_point(argv):
         m.dump()
         print("")
 
-        ###
-
-        #res = m.run("addTwo", [7, 8])
-        #assert isinstance(res, NumericValueType)
-        #print("addTwo(7,8) = %s" % value_repr(res.val))
-
-        ###
-
-        #m.run("debugTwo", [7, 8])
-
-        ###
-
-        res = m.run("main", [])
+        # Assumption is that args are I32s
+        res = m.run(entry, args)
         assert isinstance(res, NumericValueType)
-        print("main() = %s" % value_repr(res))
+        print("%s(%s) = %s" % (
+            entry, ",".join(args), value_repr(res)))
 
     except Exception as e:
 	if IS_RPYTHON:
