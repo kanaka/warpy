@@ -10,7 +10,9 @@ $(PYPY):
 	curl -O -L curl -O -L https://bitbucket.org/pypy/pypy/downloads/$@
 	unzip $(PYPY).zip
 
-%: %.py $(PYPY)
+#%: %.py $(PYPY)
+
+%: %.py
 	$(RPYTHON) --output=$@ $<
 
 .PHONY: clean stats stats-lisp
