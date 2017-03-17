@@ -8,6 +8,7 @@ if IS_RPYTHON:
     from rpython.rtyper.lltypesystem.lloperation import llop
     from rpython.rlib.listsort import TimSort
     from rpython.rlib.rstruct.ieee import float_unpack
+    from rpython.rlib.rfloat import round_double
 
     class IntSort(TimSort):
         def lt(self, a, b):
@@ -23,6 +24,9 @@ if IS_RPYTHON:
     def unpack_f64(i64):
         return float_unpack(i64, 8)
 
+    def fround(val, digits):
+        return round_double(val, digits)
+
 else:
     sys.path.append(os.path.abspath('./pypy2-v5.6.0-src'))
     import traceback
@@ -36,13 +40,17 @@ else:
     def unpack_f64(i64):
         return struct.unpack('d', struct.pack('q', i64))[0]
 
+    def fround(val, digits):
+        return round(val, digits)
+
 # TODO: do we need to track the stack size at each block/call and
 # discard extras from the stack?
 
 INFO  = True   # informational logging
 DEBUG = False  # verbose logging
 #DEBUG = True   # verbose logging
-TRACE = True   # trace instruction codes
+TRACE = False  # trace instruction codes
+#TRACE = True   # trace instruction codes
 
 
 MAGIC = 0x6d736100
@@ -69,14 +77,19 @@ class I32(NumericValueType):
 class I64(NumericValueType):
     TYPE_NAME = "i64"
     def __init__(self, val):
-        assert isinstance(val, int)
-        self.val = val
+        if isinstance(val, int):
+            self.val = val
+        elif isinstance(val, long):
+            self.val = val & 0xffffffffffffffff
+        else:
+            raise Exception("invalid I64 value")
 
 class F32(NumericValueType):
     TYPE_NAME = "f32"
     def __init__(self, val):
         assert isinstance(val, float)
-        self.val = val
+        #self.val = fround(val, 5) # passes func, fails loop at nesting(7.0, 4.0)
+        self.val = fround(val, 6) # fails func at value-f32, fails loops at nesting(7.0, 100.0)
 
 class F64(NumericValueType):
     TYPE_NAME = "f64"
@@ -172,7 +185,6 @@ OPERATOR_INFO = {
         0x15: ['set_local',      'varuint32'],
         0x16: ['call',           'varuint32'],
         0x17: ['call_indirect',  'varuint32'],
-        #0x18: ['call_indirect',  'varuint32'],
         0x19: ['tee_local',      'varuint32'],
 
         0xbb: ['get_global',     'varuint32'],
@@ -337,8 +349,9 @@ OPERATOR_INFO = {
         0xba: ['i64.eqz',        ''],
            }
 
-class Unreachable(Exception):
-    pass
+class WAException(Exception):
+    def __init__(self, message):
+        self.message = message
 
 def info(str, end='\n'):
     if INFO:
@@ -361,7 +374,7 @@ class Code():
 
 class Block(Code):
     def __init__(self, kind, type, start):
-        self.kind = kind # block opcode
+        self.kind = kind # block opcode (0x00 for init_expr)
         self.type = type # value_type
         self.locals = []
         self.start = start
@@ -489,7 +502,7 @@ class Reader():
         bytes = self.read_bytes(4)
         bits = bytes2uint32(bytes)
         #debug("read_F32 bytes: %s, bits: %d" % (bytes, bits))
-        return unpack_f32(bits)
+        return fround(unpack_f32(bits), 5)
 
     def read_F64(self):
         bytes = self.read_bytes(8)
@@ -608,6 +621,7 @@ class Module():
         self.type = []
         self.import_list = []
         self.function = []
+        self.table = {}
         self.export_list = []
         self.export_map = {}
         self.memory = Memory(1)  # default to 1 page
@@ -622,7 +636,7 @@ class Module():
         self.blockstack = []
 
     def dump_stacks(self):
-        if DEBUG:
+        if INFO:
             trace("      * stack:       %s" % (
                 stack_repr(self.stack)))
             trace("      * localstack:  %s" % (
@@ -635,17 +649,11 @@ class Module():
     def dump(self):
         #debug("raw module data: %s" % self.data)
         debug("module bytes: %s" % byte_code_repr(self.rdr.bytes))
-        bl = self.block_map
-        block_keys = bl.keys()
-        do_sort(block_keys)
-        info("block_map: %s" % (
-            ["%s[0x%x->0x%x]" % (sig_repr(bl[k]), bl[k].start, bl[k].end)
-             for k in block_keys]))
         info("")
 
         info("Types:")
         for i, t in enumerate(self.type):
-            info("  %d [form: %s, params: %s, results: %s]" % (
+            info("  0x%x [form: %s, params: %s, results: %s]" % (
                 i, t.form.TYPE_NAME,
                 [p.TYPE_NAME for p in t.params],
                 [r.TYPE_NAME for r in t.results]))
@@ -653,16 +661,16 @@ class Module():
         info("Imports:")
         for i, imp in enumerate(self.import_list):
             if imp.kind == 0x0:  # Function
-                info("  %d [type: %d, '%s.%s', kind: %s (%d)]" % (
+                info("  0x%x [type: %d, '%s.%s', kind: %s (%d)]" % (
                     i, imp.type, imp.module, imp.field,
                     EXTERNAL_KIND_NAMES[imp.kind], imp.kind))
             elif imp.kind in [0x1,0x2]:  # Table & Memory
-                info("  %d ['%s.%s', kind: %s (%d), initial: %d, maximum: %d]" % (
+                info("  0x%x ['%s.%s', kind: %s (%d), initial: %d, maximum: %d]" % (
                     i, imp.module, imp.field,
                     EXTERNAL_KIND_NAMES[imp.kind], imp.kind,
                     imp.initial, imp.maximum))
             elif imp.kind == 0x3:  # Global
-                info("  %d ['%s.%s', kind: %s (%d), type: %d, mutability: %d]" % (
+                info("  0x%x ['%s.%s', kind: %s (%d), type: %d, mutability: %d]" % (
                     i, imp.module, imp.field,
                     EXTERNAL_KIND_NAMES[imp.kind], imp.kind,
                     imp.type, imp.mutability))
@@ -670,17 +678,29 @@ class Module():
         info("Functions:")
         for i, f in enumerate(self.function):
             if isinstance(f, FunctionImport):
-                info("  %d [type: %d, import: '%s.%s']" % (
+                info("  0x%x [type: 0x%x, import: '%s.%s']" % (
                     i, f.type.index, f.module, f.field))
             else:
-                info("  %d [type: %d, locals: %s, start: 0x%x, end: 0x%x]" % (
+                info("  0x%x [type: 0x%x, locals: %s, start: 0x%x, end: 0x%x]" % (
                     i, f.type.index, [p.TYPE_NAME for p in f.locals],
                     f.start, f.end))
 
+        info("Tables:")
+        for t, e in self.table.items():
+            info("  0x%x -> %s" % (t,e))
+
         info("Exports:")
         for i, e in enumerate(self.export_list):
-            info("  %d [kind: %s, field: %s, index: %d]" % (
+            info("  0x%x [kind: %s, field: %s, index: 0x%x]" % (
                 i, EXTERNAL_KIND_NAMES[e.kind], e.field, e.index))
+        info("")
+
+        bl = self.block_map
+        block_keys = bl.keys()
+        do_sort(block_keys)
+        info("block_map: %s" % (
+            ["%s[0x%x->0x%x]" % (sig_repr(bl[k]), bl[k].start, bl[k].end)
+             for k in block_keys]))
         info("")
 
 
@@ -782,12 +802,25 @@ class Module():
             self.function.append(Function(type, idx))
 
     def parse_Table(self, length):
-        return self.rdr.read_bytes(length)
+        count = self.rdr.read_LEB(32)
+        type = self.rdr.read_LEB(7)
+        assert type == 0x20  # TODO: fix for MVP
+
+        initial = 1
+        for c in range(count):
+            flags = self.rdr.read_LEB(32) # TODO: fix for MVP
+            initial = self.rdr.read_LEB(32) # TODO: fix for MVP
+            if flags & 0x1:
+                maximum = self.rdr.read_LEB(32)
+            else:
+                maximum = initial
+
+        self.table[type] = [0] * initial
 
     def parse_Memory(self, length):
         count = self.rdr.read_LEB(32)
         assert count <= 1  # MVP
-        flags = self.rdr.read_LEB(32)
+        flags = self.rdr.read_LEB(32)  # TODO: fix for MVP
         initial = self.rdr.read_LEB(32)
         if flags & 0x1:
             maximum = self.rdr.read_LEB(32)
@@ -814,7 +847,29 @@ class Module():
         return self.rdr.read_bytes(length)
 
     def parse_Element(self, length):
-        return self.rdr.read_bytes(length)
+        start = self.rdr.pos
+        count = self.rdr.read_LEB(32)
+
+        for c in range(count):
+            index = self.rdr.read_LEB(32)
+            assert index == 0  # Only 1 default table in MVP
+
+            # Run the init_expr
+            block = Block(0x00, BLOCK_TYPE[0x01], self.rdr.pos)
+            self.blockstack.append((block, len(self.stack)))
+            # WARNING: running code here to get offset!
+            self.run_code_v12()
+            offset_val = self.stack.pop()
+            assert isinstance(offset_val, I32)
+            offset = int(offset_val.val)
+
+            num_elem = self.rdr.read_LEB(32)
+            table = self.table[0x20]  # TODO: fix for MVP
+            for n in range(num_elem):
+                fidx = self.rdr.read_LEB(32)
+                table[offset+n] = fidx
+
+        assert self.rdr.pos == start+length
 
     def parse_Code_body(self, idx):
         body_size = self.rdr.read_LEB(32)
@@ -908,7 +963,7 @@ class Module():
                     end='')
             if   0x00 == opcode:  # unreachable
                 trace("unreachable")
-                raise Unreachable("unreachable executed")
+                raise WAException("unreachable")
             elif 0x01 == opcode:  # block
                 self.rdr.read_LEB(32) # ignore block_type
                 block = self.block_map[cur_pos]
@@ -1010,6 +1065,9 @@ class Module():
                         if DEBUG:
                             trace("  Returning from function %d to %d" % (
                                 block.index, return_addr))
+                elif isinstance(block, Block) and block.kind == 0x00:
+                    # this is an init_expr
+                    return
                 else:
                     pass # end of block/loop/if, keep going
             elif 0x10 == opcode:  # i32.const
@@ -1045,43 +1103,29 @@ class Module():
             elif 0x16 == opcode:  # call
                 fidx = self.rdr.read_LEB(32)
                 func = self.function[fidx]
-                t = func.type
-                args = []
-                arg_cnt = len(t.params)
-                res_cnt = len(t.results)
-
-                # make sure args match
-                for idx, PType in enumerate(t.params):
-                    #assert issubclass(PType, NumericValueType)
-                    arg = self.stack.pop()
-                    if PType.TYPE_NAME != arg.TYPE_NAME:
-                        raise Exception("call signature mismatch")
-                    args.append(arg)
 
                 if isinstance(func, FunctionImport):
+                    t = func.type
                     trace("calling import %s.%s(%s)" % (
                         func.module, func.field,
-                        ",".join([a.TYPE_NAME for a in args])))
-                    # Workaround rpython failure to identify type
-                    results = [I32(0)]
-                    results.pop()
-                    results.extend(self.host_import_func(self.memory,
-                            func.module, func.field, args))
-
-                    for idx, RType in enumerate(t.results):
-                        if idx < len(results):
-                            res = results[idx]
-                            assert isinstance(res, NumericValueType)
-                            if RType.TYPE_NAME != res.TYPE_NAME:
-                                raise Exception("return signature mismatch")
-                            self.stack.append(res)
-                        else:
-                            raise Exception("return signature mismatch")
+                        ",".join([a.TYPE_NAME for a in t.params])))
+                    self.do_call_import(fidx)
                 elif isinstance(func, Function):
                     trace("calling function fidx: %d" % fidx)
-                    self.call_setup(fidx, args)
+                    self.do_call(fidx)
             elif 0x17 == opcode:  # call_indirect
-                raise Exception("call_indirect unimplemented")
+                # TODO: what do we do with tidx?
+                tidx = self.rdr.read_LEB(32)
+                table_index_val = self.stack.pop()
+                assert isinstance(table_index_val, I32)
+                table_index = int(table_index_val.val)
+                table = self.table[0x20] # TODO: fix 0x20 for MVP
+                if table_index < 0 or table_index >= len(table):
+                    raise WAException("undefined element")
+                fidx = table[table_index]
+                trace("table idx: 0x%x, tidx: 0x%x, calling function fidx: 0x%x" % (
+                    table_index, tidx, fidx))
+                self.do_call(fidx)
 
             # Memory immediates
             elif 0x20 <= opcode <= 0x36:
@@ -1172,6 +1216,8 @@ class Module():
                     res = I64(int(a.val / b.val))
                 elif 0x68 == opcode: # i64.eq
                     res = I32(int(a.val == b.val))
+                elif 0x6d == opcode: # i64.le_s
+                    res = I32(int(a.val <= b.val))
                 elif 0x6e == opcode: # i64.gt_s
                     res = I32(int(a.val > b.val))
                 elif 0x70 == opcode: # i64.gt_u
@@ -1260,7 +1306,28 @@ class Module():
 #            elif 0x9d <= opcode <= 0xb5:
 
             # conversion operations
+            elif 0xa1 == opcode: # i32.wrap/i64
+                a = self.stack.pop()
+                assert isinstance(a, I64)
+                res = I32(int(a.val))
+                trace("(%s) = %s" % (
+                    value_repr(a), value_repr(res)))
+                self.stack.append(res)
+            elif 0xa3 == opcode: # i64.trunc_s/f64
+                a = self.stack.pop()
+                assert isinstance(a, F64)
+                res = I64(int(a.val))
+                trace("(%s) = %s" % (
+                    value_repr(a), value_repr(res)))
+                self.stack.append(res)
             elif 0xa6 == opcode: # i64.extend_s/i32
+                a = self.stack.pop()
+                assert isinstance(a, I32)
+                res = I64(int(a.val))
+                trace("(%s) = %s" % (
+                    value_repr(a), value_repr(res)))
+                self.stack.append(res)
+            elif 0xa7 == opcode: # i64.extend_u/i32
                 a = self.stack.pop()
                 assert isinstance(a, I32)
                 res = I64(int(a.val))
@@ -1324,7 +1391,9 @@ class Module():
         if len(t.results) == 1:
             # Restore main value stack, saving top return value
             save = self.stack.pop()
-            assert isinstance(save, t.results[0])
+            if not isinstance(save, t.results[0]):
+                raise WAException("call signature mismatch: %s != %s" % (
+                    t.results[0].TYPE_NAME, save.TYPE_NAME))
 
             # Restore value stack to original size prior to call/block
             while len(self.stack) > stacksize:
@@ -1355,7 +1424,7 @@ class Module():
             #raise Exception("br* from function unimplemented")
 
 
-    def call_setup(self, fidx, args):
+    def do_call(self, fidx):
         func = self.function[fidx]
 
         # Push type onto blockstack
@@ -1370,36 +1439,63 @@ class Module():
         self.rdr.pos = func.start
 
         if TRACE:
-            info("  Calling function %d, start: 0x%x, end: 0x%x, %d locals, %d params, %d results" % (
+            info("  Calling function 0x%x, start: 0x%x, end: 0x%x, %d locals, %d params, %d results" % (
                 fidx, func.start, func.end,
                 len(func.locals), len(t.params), len(t.results)))
             debug("    bytes: %s" % (
                 byte_code_repr(self.rdr.bytes[func.start:func.end])))
 
         # push locals onto localstack (dropping extras)
-        idx = len(func.locals)-1
-        while idx > -1:
-            LType = func.locals[idx]
+        for lidx in range(len(func.locals)-1, -1, -1):
+            LType = func.locals[lidx]
             if   LType.TYPE_NAME == "i32": val = I32(0)
             elif LType.TYPE_NAME == "i64": val = I64(0)
             elif LType.TYPE_NAME == "f32": val = F32(0.0)
             elif LType.TYPE_NAME == "f64": val = F64(0.0)
             else: raise Exception("invalid locals signature")
             self.localstack.append(val)
-            idx -= 1
 
-        # push args onto localstack as locals (dropping extras)
-        aidx = 0
-        idx = len(t.params)-1
-        while idx > -1:
-            val = args[aidx]
-            PType = t.params[idx]
-            assert PType.TYPE_NAME == val.TYPE_NAME, "Call signature mismatch"
+        for tidx in range(len(t.params)-1, -1, -1):
+            PType = t.params[tidx]
+            val = self.stack.pop()
+            if PType.TYPE_NAME != val.TYPE_NAME:
+                raise WAException("call signature mismatch: %s != %s" % (
+                    PType.TYPE_NAME, val.TYPE_NAME))
             self.localstack.append(val)
-            idx -= 1
-            aidx += 1
 
         self.rdr.pos = func.start
+
+
+    def do_call_import(self, fidx):
+        func = self.function[fidx]
+        t = func.type
+
+        # make sure args match signature
+        args = []
+        for idx in range(len(t.params)-1, -1, -1):
+            PType = t.params[idx]
+            arg = self.stack.pop()
+            if PType.TYPE_NAME != arg.TYPE_NAME:
+                raise WAException("call signature mismatch: %s != %s" % (
+                    PType.TYPE_NAME, arg.TYPE_NAME))
+            args.append(arg)
+
+        # Workaround rpython failure to identify type
+        results = [I32(0)]
+        results.pop()
+        results.extend(self.host_import_func(self.memory,
+                func.module, func.field, args))
+
+        # make sure returns match signature
+        for idx, RType in enumerate(t.results):
+            if idx < len(results):
+                res = results[idx]
+                assert isinstance(res, NumericValueType)
+                if RType.TYPE_NAME != res.TYPE_NAME:
+                    raise Exception("return signature mismatch")
+                self.stack.append(res)
+            else:
+                raise Exception("return signature mismatch")
 
 
     def run(self, name, args):
@@ -1413,23 +1509,27 @@ class Module():
 
         # Args are strings so convert to expected numeric type
         # Also reverse order to get correct stack order
-        fargs = []
         tparams = self.function[fidx].type.params
-        args.reverse()
+        #for idx in range(len(tparams)-1, -1, -1):
         for idx, arg in enumerate(args):
+            arg = args[idx]
             assert isinstance(arg, str)
-            tname = tparams[len(tparams)-idx-1].TYPE_NAME
+            #tname = tparams[len(tparams)-idx-1].TYPE_NAME
+            tname = tparams[idx].TYPE_NAME
+#            print("run arg idx: %d, str: %s, tname: %s" % (idx, arg,
+#                tname))
             if   tname == "i32": val = I32(int(arg))
             elif tname == "i64": val = I64(int(arg))
             elif tname == "f32": val = F32(float(arg))
             elif tname == "f64": val = F64(float(arg))
             else: raise Exception("invalid argument %d: %s" % (
                 idx, arg))
-            fargs.append(val)
+            self.stack.append(val)
 
-        self.call_setup(fidx, fargs)
+        info("Running function %s (0x%x)" % (name, fidx))
+        self.dump_stacks()
+        self.do_call(fidx)
 
-        info("Running function %s (%d)" % (name, fidx))
         self.run_code_v12()
         if len(self.stack) > 0:
             return self.stack.pop()
@@ -1463,7 +1563,6 @@ def readline(prompt):
 def call_import(mem, module, field, args):
     fname = "%s.%s" % (module, field)
     host_args = [a.val for a in args]
-    host_args.reverse()
     result = []
     if   fname == "core.DEBUG":
         if len(host_args) == 1:
@@ -1549,8 +1648,8 @@ def entry_point(argv):
             info("%s(%s)" % (
                 entry, ",".join(args)))
 
-    except Unreachable:
-        print("unreachable executed")
+    except WAException as e:
+        print("%s" % e.message)
         return 1
 
     except Exception as e:

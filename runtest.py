@@ -92,22 +92,28 @@ def test_assert(mode, wasm, func, args, expected, returncode=0):
     out = out.rstrip("\n")
     #print("  out: '%s'" % out)
     #print("  err: %s" % err)
-    if expected != out:
+    if (expected.find("unreachable") > -1
+            and out.find("unreachable") > -1):
+        pass
+    elif (expected.find("call signature mismatch") > -1
+            and out.find("call signature mismatch") > -1):
+        pass
+    elif expected != out:
         raise Exception("Failed:\n  expected: '%s'\n  got: '%s'" % (
             expected, out))
 
 def test_assert_return(wasm, form):
     # params, return
-    m = re.search('^\(assert_return\s+\(invoke\s+"([^"]+)"\s+(\(.*\))\s*\)\s*(\([^)]+\))\s*\)\s*$', form)
+    m = re.search('^\(assert_return\s+\(invoke\s+"([^"]+)"\s+(\(.*\))\s*\)\s*(\([^)]+\))\s*\)\s*$', form, re.S)
     if not m:
         # no params, return
-        m = re.search('^\(assert_return\s+\(invoke\s+"([^"]+)"\s*\)\s+()(\([^)]+\))\s*\)\s*$', form)
+        m = re.search('^\(assert_return\s+\(invoke\s+"([^"]+)"\s*\)\s+()(\([^)]+\))\s*\)\s*$', form, re.S)
     if not m:
         # params, no return
-        m = re.search('^\(assert_return\s+\(invoke\s+"([^"]+)"\s+(\(.*\))()\s*\)\s*\)\s*$', form)
+        m = re.search('^\(assert_return\s+\(invoke\s+"([^"]+)"\s+(\(.*\))()\s*\)\s*\)\s*$', form, re.S)
     if not m:
         # no params, no return
-        m = re.search('^\(assert_return\s+\(invoke\s+"([^"]+)"\s*()()\)\s*\)\s*$', form)
+        m = re.search('^\(assert_return\s+\(invoke\s+"([^"]+)"\s*()()\)\s*\)\s*$', form, re.S)
     if not m:
         raise Exception("unparsed assert_return: '%s'" % form)
     func = m.group(1)
