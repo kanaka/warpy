@@ -1,6 +1,6 @@
 RPYTHON = rpython
 
-RPYTHON_OPTS = --opt=jit
+RPYTHON_OPTS =
 
 PYPY = pypy2-v5.6.0-src
 
@@ -14,7 +14,10 @@ $(PYPY):
 
 #%: %.py $(PYPY)
 
-%: %.py
+%-jit: %.py
+	$(RPYTHON) $(RPYTHON_OPTS) --opt=jit --output=$@ $<
+
+%-nojit: %.py
 	$(RPYTHON) $(RPYTHON_OPTS) --output=$@ $<
 
 .PHONY: clean stats stats-lisp
