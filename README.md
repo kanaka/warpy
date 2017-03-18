@@ -12,16 +12,16 @@ You will need to compile your wast sources using an older version of
 `wast2wasm` or `wasm-opt`
 
 ```
-wast2wasm test/fact_fib.wast -o test/fact_fib.wasm
+wast2wasm foo.wast -o foo.wasm
 make warpy
-./warpy test/fact_fib.wasm fact 10
+./warpy foo.wasm myfunc 10
 ```
 
 You can also run warpy using standard python (but it's much slower of
 course):
 
 ```
-python warpy.py test/fact_fib.wasm fact 10
+python warpy.py foo.wasm myfunc 10
 ```
 
 ## License
