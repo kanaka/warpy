@@ -4,6 +4,16 @@ import sys, os, math
 IS_RPYTHON = sys.argv[0].endswith('rpython')
 
 if IS_RPYTHON:
+    # JIT Stuff
+    from rpython.jit.codewriter.policy import JitPolicy
+    def jitpolicy(driver):
+        return JitPolicy()
+    from rpython.rlib.jit import JitDriver
+    jitdriver = JitDriver(
+            greens=['pc', 'code', 'function', 'table', 'block_map'],
+            reds=['memory', 'stack', 'localstack', 'blockstack',
+                'returnstack'])
+
     from rpython.rtyper.lltypesystem import lltype
     from rpython.rtyper.lltypesystem.lloperation import llop
     from rpython.rlib.listsort import TimSort
@@ -439,102 +449,37 @@ def bytes2uint64(b):
             (b[3]<<24) + (b[2]<<16) + (b[1]<<8) + b[0])
 
 
-class Memory():
-    def __init__(self, pages=1, bytes=[]):
-        debug("pages: %d" % pages)
-        self.bytes = bytes + ([0]*((pages*(2**16))-len(bytes)))
-        #self.bytes = [0]*(pages*(2**16))
+# https://en.wikipedia.org/wiki/LEB128
+def read_LEB(bytes, pos, maxbits=32, signed=False):
+    result = 0
+    shift = 0
 
-    def read_byte(self, pos):
-        b = self.bytes[pos]
-        return b
+    bcnt = 0
+    startpos = pos
+    while True:
+        byte = bytes[pos]
+        pos += 1
+        result |= ((byte & 0x7f)<<shift)
+        shift +=7
+        if (byte & 0x80) == 0:
+            break
+        # Sanity check length against maxbits
+        bcnt += 1
+        if bcnt > math.ceil(maxbits/7.0):
+            raise Exception("Unsigned LEB at byte %s overflow" %
+                    startpos)
+    if signed and (shift < maxbits) and (byte & 0x40):
+        # Sign extend
+        result |= - (1 << shift)
+    return (pos, result)
 
-    def write_byte(self, pos, val):
-        self.bytes[pos] = val
+def read_F32(bytes):
+    bits = bytes2uint32(bytes)
+    return fround(unpack_f32(bits), 5)
 
-    def read_I32(self, pos):
-        return bytes2uint32(self.bytes[pos:pos+4])
-
-    def read_I64(self, pos):
-        return bytes2uint32(self.bytes[pos:pos+8])
-
-    def write_I32(self, pos, val):
-        assert isinstance(pos, int)
-        self.bytes[pos]   = val & 0xff
-        self.bytes[pos+1] = (val & 0xff00)>>8
-        self.bytes[pos+2] = (val & 0xff0000)>>16
-        self.bytes[pos+3] = (val & 0xff000000)>>24
-
-    def write_I64(self, pos, val):
-        assert isinstance(pos, int)
-        self.bytes[pos]   = val & 0xff
-        self.bytes[pos+1] = (val & 0xff00)>>8
-        self.bytes[pos+2] = (val & 0xff0000)>>16
-        self.bytes[pos+3] = (val & 0xff000000)>>24
-        self.bytes[pos+4] = (val & 0xff00000000)>>32
-        self.bytes[pos+5] = (val & 0xff0000000000)>>40
-        self.bytes[pos+6] = (val & 0xff000000000000)>>48
-        self.bytes[pos+7] = (val & 0xff00000000000000)>>56
-
-class Reader():
-    def __init__(self, bytes):
-        self.bytes = bytes
-        self.pos = 0
-
-    def read_byte(self):
-        b = self.bytes[self.pos]
-        self.pos += 1
-        return b
-
-    def read_word(self):
-        w = bytes2uint32(self.bytes[self.pos:self.pos+4])
-        self.pos += 4
-        return w
-
-    def read_bytes(self, cnt):
-        assert cnt >= 0
-        assert self.pos >= 0
-        bytes = self.bytes[self.pos:self.pos+cnt]
-        self.pos += cnt
-        return bytes
-
-    def read_F32(self):
-        bytes = self.read_bytes(4)
-        bits = bytes2uint32(bytes)
-        #debug("read_F32 bytes: %s, bits: %d" % (bytes, bits))
-        return fround(unpack_f32(bits), 5)
-
-    def read_F64(self):
-        bytes = self.read_bytes(8)
-        bits = bytes2uint64(bytes)
-        #debug("read_F64 bytes: %s, bits: %d" % (bytes, bits))
-        return unpack_f64(bits)
-
-    # https://en.wikipedia.org/wiki/LEB128
-    def read_LEB(self, maxbits=32, signed=False):
-        result = 0
-        shift = 0
-
-        bcnt = 0
-        startpos = self.pos
-        while True:
-            byte = self.read_byte()
-            result |= ((byte & 0x7f)<<shift)
-            shift +=7
-            if (byte & 0x80) == 0:
-                break
-            # Sanity check length against maxbits
-            bcnt += 1
-            if bcnt > math.ceil(maxbits/7.0):
-                raise Exception("Unsigned LEB at byte %s overflow" %
-                        startpos)
-        if signed and (shift < maxbits) and (byte & 0x40):
-            # Sign extend
-            result |= - (1 << shift)
-        return result
-
-    def eof(self):
-        return self.pos >= len(self.bytes)
+def read_F64(bytes):
+    bits = bytes2uint64(bytes)
+    return unpack_f64(bits)
 
 def value_repr(val):
     if isinstance(val,I32):
@@ -608,6 +553,198 @@ def drop_immediates(rdr, opcode):
     else:
         raise Exception("unknown immediate type %s" % imtype)
 
+
+def pop_sig(stack, localstack, blockstack):
+    block, stacksize = blockstack.pop()
+    t = block.type
+    local_cnt = len(block.type.params) + len(block.locals)
+
+    # Restore local stack
+    for i in range(local_cnt):
+        localstack.pop()
+
+    # Validate return value if there is one
+    if len(t.results) > 1:
+        raise Exception("multiple return values unimplemented")
+    if len(stack) < len(t.results):
+        raise Exception("stack underflow")
+
+    if len(t.results) == 1:
+        # Restore main value stack, saving top return value
+        save = stack.pop()
+        if not isinstance(save, t.results[0]):
+            raise WAException("call signature mismatch: %s != %s" % (
+                t.results[0].TYPE_NAME, save.TYPE_NAME))
+
+        # Restore value stack to original size prior to call/block
+        while len(stack) > stacksize:
+            stack.pop()
+
+        # Put back return value if we have one
+        stack.append(save)
+    else:
+        # Restore value stack to original size prior to call/block
+        while len(stack) > stacksize:
+            stack.pop()
+
+    return block
+
+def do_branch(stack, localstack, blockstack, depth):
+    assert len(blockstack) > depth
+    target_block, stack_size = blockstack[-1-depth]
+    if isinstance(target_block, Block):
+        block = pop_sig(stack, localstack, blockstack)
+        for r in range(depth):
+            block = pop_sig(stack, localstack, blockstack)
+        return block.br_addr
+    else:
+        for r in range(depth):
+            block = pop_sig(stack, localstack, blockstack)
+        return target_block.end
+        #raise Exception("br* from function unimplemented")
+
+def do_call_import(stack, memory, host_import_func, func):
+    t = func.type
+
+    # make sure args match signature
+    args = []
+    for idx in range(len(t.params)-1, -1, -1):
+        PType = t.params[idx]
+        arg = stack.pop()
+        if PType.TYPE_NAME != arg.TYPE_NAME:
+            raise WAException("call signature mismatch: %s != %s" % (
+                PType.TYPE_NAME, arg.TYPE_NAME))
+        args.append(arg)
+
+    # Workaround rpython failure to identify type
+    results = [I32(0)]
+    results.pop()
+    results.extend(host_import_func(memory,
+            func.module, func.field, args))
+
+    # make sure returns match signature
+    for idx, RType in enumerate(t.results):
+        if idx < len(results):
+            res = results[idx]
+            assert isinstance(res, NumericValueType)
+            if RType.TYPE_NAME != res.TYPE_NAME:
+                raise Exception("return signature mismatch")
+            stack.append(res)
+        else:
+            raise Exception("return signature mismatch")
+
+def do_call(stack, localstack, blockstack, returnstack, func, pc):
+
+    # Push type onto blockstack
+    t = func.type
+    blockstack.append((func, len(stack)))
+
+    # Push return address onto returnstack
+    assert len(returnstack) < CALLSTACK_MAX, "call stack exhausted"
+    returnstack.append(pc)
+
+    # Update the pos/instruction counter to the function
+    pc = func.start
+
+    if TRACE:
+        info("  Calling function 0x%x, start: 0x%x, end: 0x%x, %d locals, %d params, %d results" % (
+            func.index, func.start, func.end,
+            len(func.locals), len(t.params), len(t.results)))
+
+    # push locals onto localstack (dropping extras)
+    for lidx in range(len(func.locals)-1, -1, -1):
+        LType = func.locals[lidx]
+        if   LType.TYPE_NAME == "i32": val = I32(0)
+        elif LType.TYPE_NAME == "i64": val = I64(0)
+        elif LType.TYPE_NAME == "f32": val = F32(0.0)
+        elif LType.TYPE_NAME == "f64": val = F64(0.0)
+        else: raise Exception("invalid locals signature")
+        localstack.append(val)
+
+    for tidx in range(len(t.params)-1, -1, -1):
+        PType = t.params[tidx]
+        val = stack.pop()
+        if PType.TYPE_NAME != val.TYPE_NAME:
+            raise WAException("call signature mismatch: %s != %s" % (
+                PType.TYPE_NAME, val.TYPE_NAME))
+        localstack.append(val)
+
+    return pc
+
+
+
+class Memory():
+    def __init__(self, pages=1, bytes=[]):
+        debug("pages: %d" % pages)
+        self.bytes = bytes + ([0]*((pages*(2**16))-len(bytes)))
+        #self.bytes = [0]*(pages*(2**16))
+
+    def read_byte(self, pos):
+        b = self.bytes[pos]
+        return b
+
+    def write_byte(self, pos, val):
+        self.bytes[pos] = val
+
+    def read_I32(self, pos):
+        return bytes2uint32(self.bytes[pos:pos+4])
+
+    def read_I64(self, pos):
+        return bytes2uint32(self.bytes[pos:pos+8])
+
+    def write_I32(self, pos, val):
+        assert isinstance(pos, int)
+        self.bytes[pos]   = val & 0xff
+        self.bytes[pos+1] = (val & 0xff00)>>8
+        self.bytes[pos+2] = (val & 0xff0000)>>16
+        self.bytes[pos+3] = (val & 0xff000000)>>24
+
+    def write_I64(self, pos, val):
+        assert isinstance(pos, int)
+        self.bytes[pos]   = val & 0xff
+        self.bytes[pos+1] = (val & 0xff00)>>8
+        self.bytes[pos+2] = (val & 0xff0000)>>16
+        self.bytes[pos+3] = (val & 0xff000000)>>24
+        self.bytes[pos+4] = (val & 0xff00000000)>>32
+        self.bytes[pos+5] = (val & 0xff0000000000)>>40
+        self.bytes[pos+6] = (val & 0xff000000000000)>>48
+        self.bytes[pos+7] = (val & 0xff00000000000000)>>56
+
+class Reader():
+    def __init__(self, bytes):
+        self.bytes = bytes
+        self.pos = 0
+
+    def read_byte(self):
+        b = self.bytes[self.pos]
+        self.pos += 1
+        return b
+
+    def read_word(self):
+        w = bytes2uint32(self.bytes[self.pos:self.pos+4])
+        self.pos += 4
+        return w
+
+    def read_bytes(self, cnt):
+        assert cnt >= 0
+        assert self.pos >= 0
+        bytes = self.bytes[self.pos:self.pos+cnt]
+        self.pos += cnt
+        return bytes
+
+    def read_LEB(self, maxbits=32, signed=False):
+        [self.pos, result] = read_LEB(self.bytes, self.pos,
+                maxbits, signed)
+        return result
+
+    def read_F32(self):
+        return read_F32(self.read_bytes(4))
+
+    def read_F64(self):
+        return read_F64(self.read_bytes(8))
+
+    def eof(self):
+        return self.pos >= len(self.bytes)
 
 class Module():
     def __init__(self, data, host_import_func, exports):
@@ -858,7 +995,7 @@ class Module():
             block = Block(0x00, BLOCK_TYPE[0x01], self.rdr.pos)
             self.blockstack.append((block, len(self.stack)))
             # WARNING: running code here to get offset!
-            self.run_code_v12()
+            self.rdr.pos = self.interpret_v12(self.rdr.pos)
             offset_val = self.stack.pop()
             assert isinstance(offset_val, I32)
             offset = int(offset_val.val)
@@ -952,180 +1089,223 @@ class Module():
 
     ###
 
+
     # TODO: update for MVP
-    def run_code_v12(self):
-        while not self.rdr.eof():
-            self.dump_stacks()
-            cur_pos = self.rdr.pos
-            opcode = self.rdr.read_byte()
-            trace("    [0x%x %s (0x%x)] - " % (
-                    cur_pos, OPERATOR_INFO[opcode][0], opcode),
-                    end='')
+    def interpret_v12(self, start_pc):
+        host_import_func = self.host_import_func
+
+        # Greens
+        pc = start_pc
+        code = self.rdr.bytes
+        function = self.function
+        table = self.table
+        block_map = self.block_map
+
+        # Reds
+        memory = self.memory
+        stack = self.stack
+        localstack = self.localstack
+        blockstack = self.blockstack
+        returnstack = self.returnstack
+
+        while pc < len(code):
+            if IS_RPYTHON:
+                jitdriver.jit_merge_point(
+                        pc=pc,
+                        code=code,
+                        function=function,
+                        table=table,
+                        block_map=block_map,
+
+                        memory=memory,
+                        stack=stack,
+                        localstack=localstack,
+                        blockstack=blockstack,
+                        returnstack=returnstack)
+
+#            if TRACE: self.dump_stacks()
+            cur_pc = pc
+            opcode = code[pc]
+            pc += 1
+#            trace("    [0x%x %s (0x%x)] - " % (
+#                    cur_pc, OPERATOR_INFO[opcode][0], opcode),
+#                    end='')
             if   0x00 == opcode:  # unreachable
-                trace("unreachable")
+#                trace("unreachable")
                 raise WAException("unreachable")
             elif 0x01 == opcode:  # block
-                self.rdr.read_LEB(32) # ignore block_type
-                block = self.block_map[cur_pos]
-                self.blockstack.append((block, len(self.stack)))
-                trace("sig: %s at 0x%x" % (
-                    sig_repr(block), cur_pos))
+                pc, ignore = read_LEB(code, pc, 32) # ignore block_type
+                block = block_map[cur_pc]
+                blockstack.append((block, len(stack)))
+#                trace("sig: %s at 0x%x" % (
+#                    sig_repr(block), cur_pc))
             elif 0x02 == opcode:  # loop
-                self.rdr.read_LEB(32) # ignore block_type
-                block = self.block_map[cur_pos]
-                self.blockstack.append((block, len(self.stack)))
-                trace("sig: %s at 0x%x" % (
-                    sig_repr(block), cur_pos))
+                pc, ignore = read_LEB(code, pc, 32) # ignore block_type
+                block = block_map[cur_pc]
+                blockstack.append((block, len(stack)))
+#                trace("sig: %s at 0x%x" % (
+#                    sig_repr(block), cur_pc))
             elif 0x03 == opcode:  # if
-                self.rdr.read_LEB(32) # ignore block_type
-                block = self.block_map[cur_pos]
-                self.blockstack.append((block, len(self.stack)))
-                cond = self.stack.pop()
+                pc, ignore = read_LEB(code, pc, 32) # ignore block_type
+                block = block_map[cur_pc]
+                blockstack.append((block, len(stack)))
+                cond = stack.pop()
                 if not cond.val:  # if false
                     # branch to else block or after end of if
                     if block.else_addr == 0:
                         # no else block so pop if block
-                        self.blockstack.pop()
-                        self.rdr.pos = block.br_addr
+                        blockstack.pop()
+                        pc = block.br_addr
                     else:
-                        self.rdr.pos = block.else_addr
-                trace("cond: %s jump to %s, sig: %s at 0x%x" % (
-                    value_repr(cond), hex(self.rdr.pos),
-                    sig_repr(block), cur_pos))
+                        pc = block.else_addr
+#                trace("cond: %s jump to 0x%x, sig: %s at 0x%x" % (
+#                    value_repr(cond), pc, sig_repr(block), cur_pc))
             elif 0x04 == opcode:  # else
-                block = self.pop_sig()
-                self.rdr.pos = block.br_addr
-                trace("of %s jump to %s" % (
-                    sig_repr(block), hex(self.rdr.pos)))
+                block = pop_sig(stack, localstack, blockstack)
+                pc = block.br_addr
+#                trace("of %s jump to 0x%x" % (sig_repr(block), pc))
             elif 0x05 == opcode:  # select
-                cond = self.stack.pop()
-                a, b = self.stack.pop(), self.stack.pop()
+                cond = stack.pop()
+                a, b = stack.pop(), stack.pop()
                 if cond.val:
-                    self.stack.append(b)
+                    stack.append(b)
                 else:
-                    self.stack.append(a)
+                    stack.append(a)
             elif 0x06 == opcode:  # br
-                relative_depth = self.rdr.read_LEB(32)
-                self.do_branch(relative_depth)
-                trace("depth: 0x%x, to: 0x%x" % (
-                    relative_depth, self.rdr.pos))
+                pc, relative_depth = read_LEB(code, pc, 32)
+                pc = do_branch(stack, localstack, blockstack,
+                        relative_depth)
+#                trace("depth: 0x%x, to: 0x%x" % (relative_depth, pc))
             elif 0x07 == opcode:  # br_if
-                relative_depth = self.rdr.read_LEB(32)
-                cond = self.stack.pop()
-                trace("cond: %s, depth: 0x%x" % (
-                    value_repr(cond), relative_depth))
+                pc, relative_depth = read_LEB(code, pc, 32)
+                cond = stack.pop()
+#                trace("cond: %s, depth: 0x%x" % (
+#                    value_repr(cond), relative_depth))
                 if cond.val:
-                    self.do_branch(relative_depth)
+                    pc = do_branch(stack, localstack, blockstack,
+                            relative_depth)
             elif 0x08 == opcode:  # br_table
-                target_count = self.rdr.read_LEB(32) # +1 to catch default
+                pc, target_count = read_LEB(code, pc, 32)
                 depths = []
                 for c in range(target_count):
-                    depths.append(self.rdr.read_LEB(32))
-                depth = self.rdr.read_LEB(32) # default
-                expr = self.stack.pop()
+                    pc, depth = read_LEB(code, pc, 32)
+                    depths.append(depth)
+                pc, depth = read_LEB(code, pc, 32) # default
+                expr = stack.pop()
                 assert isinstance(expr, I32)
                 didx = int(expr.val)
                 if didx >= 0 and didx < len(depths):
                     depth = depths[didx]
-                trace("depths: %s, index: %d, choosen depth: 0x%x" % (
-                    depths, didx, depth))
-                self.do_branch(depth)
+#                trace("depths: %s, index: %d, choosen depth: 0x%x" % (
+#                    depths, didx, depth))
+                pc = do_branch(stack, localstack, blockstack, depth)
             elif 0x09 == opcode:  # return
                 # Pop blocks until reach Function signature
-                while len(self.blockstack) > 0:
-                    if isinstance(self.blockstack[-1][0], Function): break
+                while len(blockstack) > 0:
+                    if isinstance(blockstack[-1][0], Function): break
                     # We don't use sig_pop because the end opcode
                     # handler will do this for us and catch the return
                     # value properly.
-                    block = self.blockstack.pop()
-                assert len(self.blockstack) > 0
-                block = self.blockstack[-1][0]
+                    block = blockstack.pop()
+                assert len(blockstack) > 0
+                block = blockstack[-1][0]
                 assert isinstance(block, Function)
                 # Set instruction pointer to end of function
                 # The actual sig_pop and return is handled by handling
                 # the end opcode
-                self.rdr.pos = block.end
-                trace("to 0x%x" % block.br_addr)
+                pc = block.end
+#                trace("to 0x%x" % block.br_addr)
             elif 0x0a == opcode:  # nop
-                trace("")
+#                trace("")
+                pass
             elif 0x0b == opcode:  # drop
-                trace("%s" % value_repr(self.stack[-1]))
-                self.stack.pop()
+#                trace("%s" % value_repr(stack[-1]))
+                stack.pop()
             elif 0x0f == opcode:  # end
-                block = self.pop_sig()
-                trace("of %s" % sig_repr(block))
+                block = pop_sig(stack, localstack, blockstack)
+#                trace("of %s" % sig_repr(block))
                 if isinstance(block, Function):
                     # Return to return address
-                    return_addr = self.returnstack.pop()
-                    self.rdr.pos = return_addr
-                    if len(self.returnstack) == 0:
+                    pc = returnstack.pop()
+                    if len(returnstack) == 0:
                         # Return to top-level, ignoring return_addr
-                        return None
+                        return pc
                     else:
                         if DEBUG:
-                            trace("  Returning from function %d to %d" % (
-                                block.index, return_addr))
+#                            trace("  Returning from function %d to %d" % (
+#                                block.index, return_addr))
+                            pass
                 elif isinstance(block, Block) and block.kind == 0x00:
                     # this is an init_expr
-                    return
+                    return pc
                 else:
                     pass # end of block/loop/if, keep going
             elif 0x10 == opcode:  # i32.const
-                self.stack.append(I32(int(self.rdr.read_LEB(32, signed=True))))
-                trace("%s" % value_repr(self.stack[-1]))
+                pc, val = read_LEB(code, pc, 32, signed=True)
+                stack.append(I32(int(val)))
+#                trace("%s" % value_repr(stack[-1]))
             elif 0x11 == opcode:  # i64.const
-                self.stack.append(I64(self.rdr.read_LEB(64, signed=True)))
-                trace("%s" % value_repr(self.stack[-1]))
+                pc, val = read_LEB(code, pc, 64, signed=True)
+                stack.append(I64(val))
+#                trace("%s" % value_repr(stack[-1]))
             elif 0x12 == opcode:  # f64.const
-                self.stack.append(F64(self.rdr.read_F64()))
-                trace("%s" % value_repr(self.stack[-1]))
+                bytes = code[pc:pc+4]
+                pc += 4
+                stack.append(F64(read_F64(bytes)))
+#                trace("%s" % value_repr(stack[-1]))
             elif 0x13 == opcode:  # f32.const
-                self.stack.append(F32(self.rdr.read_F32()))
-                trace("%s" % value_repr(self.stack[-1]))
+                bytes = code[pc:pc+4]
+                pc += 4
+                stack.append(F32(read_F32(bytes)))
+#                trace("%s" % value_repr(stack[-1]))
             elif 0x14 == opcode:  # get_local
-                arg = self.rdr.read_LEB(32)
-                trace("0x%x" % arg)
-                self.stack.append(self.localstack[-1-arg])
+                pc, arg = read_LEB(code, pc, 32)
+#                trace("0x%x" % arg)
+                stack.append(localstack[-1-arg])
             elif 0x15 == opcode:  # set_local
-                arg = self.rdr.read_LEB(32)
-                val = self.stack.pop()
-                self.localstack[-1-arg] = val
-                trace("0x%x to %s" % (arg, value_repr(val)))
+                pc, arg = read_LEB(code, pc, 32)
+                val = stack.pop()
+                localstack[-1-arg] = val
+#                trace("0x%x to %s" % (arg, value_repr(val)))
             elif 0x19 == opcode:  # tee_local
-                arg = self.rdr.read_LEB(32)
-                val = self.stack[-1] # like set_local but do not pop
-                self.localstack[-1-arg] = val
-                trace("0x%x to %s" % (arg, value_repr(val)))
+                pc, arg = read_LEB(code, pc, 32)
+                val = stack[-1] # like set_local but do not pop
+                localstack[-1-arg] = val
+#                trace("0x%x to %s" % (arg, value_repr(val)))
             elif 0xbb == opcode:  # get_global
                 raise Exception("get_global unimplemented")
             elif 0xbc == opcode:  # set_global
                 raise Exception("set_global unimplemented")
             elif 0x16 == opcode:  # call
-                fidx = self.rdr.read_LEB(32)
-                func = self.function[fidx]
+                pc, fidx = read_LEB(code, pc, 32)
+                func = function[fidx]
 
                 if isinstance(func, FunctionImport):
                     t = func.type
-                    trace("calling import %s.%s(%s)" % (
-                        func.module, func.field,
-                        ",".join([a.TYPE_NAME for a in t.params])))
-                    self.do_call_import(fidx)
+#                    trace("calling import %s.%s(%s)" % (
+#                        func.module, func.field,
+#                        ",".join([a.TYPE_NAME for a in t.params])))
+                    do_call_import(stack, memory, host_import_func,
+                            function[fidx])
                 elif isinstance(func, Function):
-                    trace("calling function fidx: %d" % fidx)
-                    self.do_call(fidx)
+#                    trace("calling function fidx: %d" % fidx)
+                    pc = do_call(stack, localstack, blockstack,
+                            returnstack, function[fidx], pc)
             elif 0x17 == opcode:  # call_indirect
                 # TODO: what do we do with tidx?
-                tidx = self.rdr.read_LEB(32)
-                table_index_val = self.stack.pop()
+                pc, tidx = read_LEB(code, pc, 32)
+                table_index_val = stack.pop()
                 assert isinstance(table_index_val, I32)
                 table_index = int(table_index_val.val)
-                table = self.table[0x20] # TODO: fix 0x20 for MVP
-                if table_index < 0 or table_index >= len(table):
+                tbl = table[0x20] # TODO: fix 0x20 for MVP
+                if table_index < 0 or table_index >= len(tbl):
                     raise WAException("undefined element")
-                fidx = table[table_index]
-                trace("table idx: 0x%x, tidx: 0x%x, calling function fidx: 0x%x" % (
-                    table_index, tidx, fidx))
-                self.do_call(fidx)
+                fidx = tbl[table_index]
+#                trace("table idx: 0x%x, tidx: 0x%x, calling function fidx: 0x%x" % (
+#                    table_index, tidx, fidx))
+                pc = do_call(stack, localstack,
+                        blockstack, returnstack,
+                        function[fidx], pc)
 
             # Memory immediates
             elif 0x20 <= opcode <= 0x36:
@@ -1141,7 +1321,7 @@ class Module():
 
             # i32 unary operations
             elif opcode in [0x57, 0x58, 0x59, 0x5a]:
-                a = self.stack.pop()
+                a = stack.pop()
                 assert isinstance(a, I32)
                 if   0x58 == opcode: # i32.ctz
                     count = 0
@@ -1155,13 +1335,13 @@ class Module():
                 else:
                     raise Exception("%s unimplemented"
                             % OPERATOR_INFO[opcode][0])
-                trace("(%s) = %s" % (
-                    value_repr(a), value_repr(res)))
-                self.stack.append(res)
+#                trace("(%s) = %s" % (
+#                    value_repr(a), value_repr(res)))
+                stack.append(res)
 
             # i32 binary operations
             elif 0x40 <= opcode <= 0x5a or opcode in [0xb6, 0xb7]:
-                b, a = self.stack.pop(), self.stack.pop()
+                b, a = stack.pop(), stack.pop()
                 assert isinstance(a, I32) and isinstance(b, I32)
                 if   0x40 == opcode: # i32.add
                     res = I32(int(a.val + b.val))
@@ -1185,26 +1365,26 @@ class Module():
                     raise Exception("%s unimplemented"
                             % OPERATOR_INFO[opcode][0])
 
-                trace("(%s, %s) = %s" % (
-                    value_repr(a), value_repr(b), value_repr(res)))
-                self.stack.append(res)
+#                trace("(%s, %s) = %s" % (
+#                    value_repr(a), value_repr(b), value_repr(res)))
+                stack.append(res)
 
             # i64 unary operations
             elif opcode in [0x72, 0x73, 0x74, 0xba]:
-                a = self.stack.pop()
+                a = stack.pop()
                 assert isinstance(a, I64)
                 if   0xba == opcode: # i64.eqz
                     res = I32(int(a.val == 0))
                 else:
                     raise Exception("%s unimplemented"
                             % OPERATOR_INFO[opcode][0])
-                trace("(%s) = %s" % (
-                    value_repr(a), value_repr(res)))
-                self.stack.append(res)
+#                trace("(%s) = %s" % (
+#                    value_repr(a), value_repr(res)))
+                stack.append(res)
 
             # i64 binary operations
             elif 0x5b <= opcode <= 0x74 or opcode in [0xb8, 0xb9]:
-                b, a = self.stack.pop(), self.stack.pop()
+                b, a = stack.pop(), stack.pop()
                 assert isinstance(a, I64) and isinstance(b, I64)
                 if   0x5b == opcode: # i64.add
                     res = I64(int(a.val + b.val))
@@ -1226,13 +1406,13 @@ class Module():
                     raise Exception("%s unimplemented"
                             % OPERATOR_INFO[opcode][0])
 
-                trace("(%s, %s) = %s" % (
-                    value_repr(a), value_repr(b), value_repr(res)))
-                self.stack.append(res)
+#                trace("(%s, %s) = %s" % (
+#                    value_repr(a), value_repr(b), value_repr(res)))
+                stack.append(res)
 
             # f32 unary operations
             elif opcode in [0x7b, 0x7c]:
-                a = self.stack.pop()
+                a = stack.pop()
                 assert isinstance(a, F32)
                 if   0x7b == opcode: # f32.abs
                     res = F32(abs(a.val))
@@ -1241,13 +1421,13 @@ class Module():
                 else:
                     raise Exception("%s unimplemented"
                             % OPERATOR_INFO[opcode][0])
-                trace("(%s) = %s" % (
-                    value_repr(a), value_repr(res)))
-                self.stack.append(res)
+#                trace("(%s) = %s" % (
+#                    value_repr(a), value_repr(res)))
+                stack.append(res)
 
             # f32 binary operations
             elif 0x75 <= opcode <= 0x88:
-                b, a = self.stack.pop(), self.stack.pop()
+                b, a = stack.pop(), stack.pop()
                 assert isinstance(a, F32) and isinstance(b, F32)
                 if   0x75 == opcode: # f32.add
                     res = F32(float(a.val + b.val))
@@ -1267,13 +1447,13 @@ class Module():
                     raise Exception("%s unimplemented"
                             % OPERATOR_INFO[opcode][0])
 
-                trace("(%s, %s) = %s" % (
-                    value_repr(a), value_repr(b), value_repr(res)))
-                self.stack.append(res)
+#                trace("(%s, %s) = %s" % (
+#                    value_repr(a), value_repr(b), value_repr(res)))
+                stack.append(res)
 
             # f64 unary operations
             elif opcode in [0x8f, 0x90]:
-                a = self.stack.pop()
+                a = stack.pop()
                 assert isinstance(a, F64)
                 if   0x8f == opcode: # f32.abs
                     res = F64(abs(a.val))
@@ -1282,13 +1462,13 @@ class Module():
                 else:
                     raise Exception("%s unimplemented"
                             % OPERATOR_INFO[opcode][0])
-                trace("(%s) = %s" % (
-                    value_repr(a), value_repr(res)))
-                self.stack.append(res)
+#                trace("(%s) = %s" % (
+#                    value_repr(a), value_repr(res)))
+                stack.append(res)
 
             # f64 binary operations
             elif 0x89 <= opcode <= 0x9c:
-                b, a = self.stack.pop(), self.stack.pop()
+                b, a = stack.pop(), stack.pop()
                 assert isinstance(a, F64) and isinstance(b, F64)
                 if   0x89 == opcode: # f64.add
                     res = F64(float(a.val + b.val))
@@ -1298,204 +1478,85 @@ class Module():
                     raise Exception("%s unimplemented"
                             % OPERATOR_INFO[opcode][0])
 
-                trace("(%s, %s) = %s" % (
-                    value_repr(a), value_repr(b), value_repr(res)))
-                self.stack.append(res)
+#                trace("(%s, %s) = %s" % (
+#                    value_repr(a), value_repr(b), value_repr(res)))
+                stack.append(res)
 
-#            # conversion operations
-#            elif 0x9d <= opcode <= 0xb5:
+            ## conversion operations
+            #elif 0x9d <= opcode <= 0xb5:
 
             # conversion operations
             elif 0xa1 == opcode: # i32.wrap/i64
-                a = self.stack.pop()
+                a = stack.pop()
                 assert isinstance(a, I64)
                 res = I32(int(a.val))
-                trace("(%s) = %s" % (
-                    value_repr(a), value_repr(res)))
-                self.stack.append(res)
+#                trace("(%s) = %s" % (
+#                    value_repr(a), value_repr(res)))
+                stack.append(res)
             elif 0xa3 == opcode: # i64.trunc_s/f64
-                a = self.stack.pop()
+                a = stack.pop()
                 assert isinstance(a, F64)
                 res = I64(int(a.val))
-                trace("(%s) = %s" % (
-                    value_repr(a), value_repr(res)))
-                self.stack.append(res)
+#                trace("(%s) = %s" % (
+#                    value_repr(a), value_repr(res)))
+                stack.append(res)
             elif 0xa6 == opcode: # i64.extend_s/i32
-                a = self.stack.pop()
+                a = stack.pop()
                 assert isinstance(a, I32)
                 res = I64(int(a.val))
-                trace("(%s) = %s" % (
-                    value_repr(a), value_repr(res)))
-                self.stack.append(res)
+#                trace("(%s) = %s" % (
+#                    value_repr(a), value_repr(res)))
+                stack.append(res)
             elif 0xa7 == opcode: # i64.extend_u/i32
-                a = self.stack.pop()
+                a = stack.pop()
                 assert isinstance(a, I32)
                 res = I64(int(a.val))
-                trace("(%s) = %s" % (
-                    value_repr(a), value_repr(res)))
-                self.stack.append(res)
+#                trace("(%s) = %s" % (
+#                    value_repr(a), value_repr(res)))
+                stack.append(res)
             elif 0xae == opcode: # f64.convert_s/i32
-                a = self.stack.pop()
+                a = stack.pop()
                 assert isinstance(a, I32)
                 res = F64(float(a.val))
-                trace("(%s) = %s" % (
-                    value_repr(a), value_repr(res)))
-                self.stack.append(res)
+#                trace("(%s) = %s" % (
+#                    value_repr(a), value_repr(res)))
+                stack.append(res)
             elif 0xaf == opcode: # f64.convert_u/i32
-                a = self.stack.pop()
+                a = stack.pop()
                 assert isinstance(a, I32)
                 res = F64(float(a.val))
-                trace("(%s) = %s" % (
-                    value_repr(a), value_repr(res)))
-                self.stack.append(res)
+#                trace("(%s) = %s" % (
+#                    value_repr(a), value_repr(res)))
+                stack.append(res)
             elif 0xb0 == opcode: # f64.convert_s/i64
-                a = self.stack.pop()
+                a = stack.pop()
                 assert isinstance(a, I64)
                 res = F64(float(a.val))
-                trace("(%s) = %s" % (
-                    value_repr(a), value_repr(res)))
-                self.stack.append(res)
+#                trace("(%s) = %s" % (
+#                    value_repr(a), value_repr(res)))
+                stack.append(res)
             elif 0xb1 == opcode: # f64.convert_u/i64
-                a = self.stack.pop()
+                a = stack.pop()
                 assert isinstance(a, I64)
                 res = F64(float(a.val))
-                trace("(%s) = %s" % (
-                    value_repr(a), value_repr(res)))
-                self.stack.append(res)
+#                trace("(%s) = %s" % (
+#                    value_repr(a), value_repr(res)))
+                stack.append(res)
             elif 0xb2 == opcode: # f64.promote/f32
-                a = self.stack.pop()
+                a = stack.pop()
                 assert isinstance(a, F32)
                 res = F64(float(a.val))
-                trace("(%s) = %s" % (
-                    value_repr(a), value_repr(res)))
-                self.stack.append(res)
+#                trace("(%s) = %s" % (
+#                    value_repr(a), value_repr(res)))
+                stack.append(res)
 
             else:
                 raise Exception("unrecognized opcode %d" % opcode)
 
-    def pop_sig(self):
-        block, stacksize = self.blockstack.pop()
-        t = block.type
-        local_cnt = len(block.type.params) + len(block.locals)
-
-        # Restore local stack
-        for i in range(local_cnt):
-            self.localstack.pop()
-
-        # Validate return value if there is one
-        if len(t.results) > 1:
-            raise Exception("multiple return values unimplemented")
-        if len(self.stack) < len(t.results):
-            raise Exception("stack underflow")
-
-        if len(t.results) == 1:
-            # Restore main value stack, saving top return value
-            save = self.stack.pop()
-            if not isinstance(save, t.results[0]):
-                raise WAException("call signature mismatch: %s != %s" % (
-                    t.results[0].TYPE_NAME, save.TYPE_NAME))
-
-            # Restore value stack to original size prior to call/block
-            while len(self.stack) > stacksize:
-                self.stack.pop()
-
-            # Put back return value if we have one
-            self.stack.append(save)
-        else:
-            # Restore value stack to original size prior to call/block
-            while len(self.stack) > stacksize:
-                self.stack.pop()
-
-        return block
+        return pc
 
 
-    def do_branch(self, depth):
-        assert len(self.blockstack) > depth
-        target_block, stack_size = self.blockstack[-1-depth]
-        if isinstance(target_block, Block):
-            block = self.pop_sig()
-            for r in range(depth):
-                block = self.pop_sig()
-            self.rdr.pos = block.br_addr
-        else:
-            for r in range(depth):
-                block = self.pop_sig()
-            self.rdr.pos = target_block.end
-            #raise Exception("br* from function unimplemented")
 
-
-    def do_call(self, fidx):
-        func = self.function[fidx]
-
-        # Push type onto blockstack
-        t = func.type
-        self.blockstack.append((func, len(self.stack)))
-
-        # Push return address onto returnstack
-        assert len(self.returnstack) < CALLSTACK_MAX, "call stack exhausted"
-        self.returnstack.append(self.rdr.pos)
-
-        # Update the pos/instruction counter to the function
-        self.rdr.pos = func.start
-
-        if TRACE:
-            info("  Calling function 0x%x, start: 0x%x, end: 0x%x, %d locals, %d params, %d results" % (
-                fidx, func.start, func.end,
-                len(func.locals), len(t.params), len(t.results)))
-            debug("    bytes: %s" % (
-                byte_code_repr(self.rdr.bytes[func.start:func.end])))
-
-        # push locals onto localstack (dropping extras)
-        for lidx in range(len(func.locals)-1, -1, -1):
-            LType = func.locals[lidx]
-            if   LType.TYPE_NAME == "i32": val = I32(0)
-            elif LType.TYPE_NAME == "i64": val = I64(0)
-            elif LType.TYPE_NAME == "f32": val = F32(0.0)
-            elif LType.TYPE_NAME == "f64": val = F64(0.0)
-            else: raise Exception("invalid locals signature")
-            self.localstack.append(val)
-
-        for tidx in range(len(t.params)-1, -1, -1):
-            PType = t.params[tidx]
-            val = self.stack.pop()
-            if PType.TYPE_NAME != val.TYPE_NAME:
-                raise WAException("call signature mismatch: %s != %s" % (
-                    PType.TYPE_NAME, val.TYPE_NAME))
-            self.localstack.append(val)
-
-        self.rdr.pos = func.start
-
-
-    def do_call_import(self, fidx):
-        func = self.function[fidx]
-        t = func.type
-
-        # make sure args match signature
-        args = []
-        for idx in range(len(t.params)-1, -1, -1):
-            PType = t.params[idx]
-            arg = self.stack.pop()
-            if PType.TYPE_NAME != arg.TYPE_NAME:
-                raise WAException("call signature mismatch: %s != %s" % (
-                    PType.TYPE_NAME, arg.TYPE_NAME))
-            args.append(arg)
-
-        # Workaround rpython failure to identify type
-        results = [I32(0)]
-        results.pop()
-        results.extend(self.host_import_func(self.memory,
-                func.module, func.field, args))
-
-        # make sure returns match signature
-        for idx, RType in enumerate(t.results):
-            if idx < len(results):
-                res = results[idx]
-                assert isinstance(res, NumericValueType)
-                if RType.TYPE_NAME != res.TYPE_NAME:
-                    raise Exception("return signature mismatch")
-                self.stack.append(res)
-            else:
-                raise Exception("return signature mismatch")
 
 
     def run(self, name, args):
@@ -1528,9 +1589,11 @@ class Module():
 
         info("Running function %s (0x%x)" % (name, fidx))
         self.dump_stacks()
-        self.do_call(fidx)
+        pc = do_call(self.stack, self.localstack,
+                self.blockstack, self.returnstack,
+                self.function[fidx], len(self.rdr.bytes))
 
-        self.run_code_v12()
+        self.interpret_v12(pc)
         if len(self.stack) > 0:
             return self.stack.pop()
         else:

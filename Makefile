@@ -1,5 +1,7 @@
 RPYTHON = rpython
 
+RPYTHON_OPTS = --opt=jit
+
 PYPY = pypy2-v5.6.0-src
 
 SOURCES = wasty.py
@@ -13,7 +15,7 @@ $(PYPY):
 #%: %.py $(PYPY)
 
 %: %.py
-	$(RPYTHON) --output=$@ $<
+	$(RPYTHON) $(RPYTHON_OPTS) --output=$@ $<
 
 .PHONY: clean stats stats-lisp
 
