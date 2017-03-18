@@ -30,11 +30,14 @@ if IS_RPYTHON:
     def do_sort(a):
         IntSort(a).sort()
 
+    @purefunction
     def unpack_f32(i32):
         return float_unpack(i32, 4)
+    @purefunction
     def unpack_f64(i64):
         return float_unpack(i64, 8)
 
+    @purefunction
     def fround(val, digits):
         return round_double(val, digits)
 
@@ -430,15 +433,18 @@ def trace(str, end='\n'):
         os.write(2, str + end)
         #if end == '': sys.stderr.flush()
 
+@purefunction
 def bytes2uint32(b):
     return ((b[3]<<24) + (b[2]<<16) + (b[1]<<8) + b[0])
 
+@purefunction
 def bytes2uint64(b):
     return ((b[7]<<56) + (b[6]<<48) + (b[5]<<40) + (b[4]<<32) +
             (b[3]<<24) + (b[2]<<16) + (b[1]<<8) + b[0])
 
 
 # https://en.wikipedia.org/wiki/LEB128
+@purefunction
 def read_LEB(bytes, pos, maxbits=32, signed=False):
     result = 0
     shift = 0
@@ -462,10 +468,12 @@ def read_LEB(bytes, pos, maxbits=32, signed=False):
         result |= - (1 << shift)
     return (pos, result)
 
+@purefunction
 def read_F32(bytes):
     bits = bytes2uint32(bytes)
     return fround(unpack_f32(bits), 5)
 
+@purefunction
 def read_F64(bytes):
     bits = bytes2uint64(bytes)
     return unpack_f64(bits)
@@ -732,6 +740,7 @@ def get_function(function, fidx):
 @purefunction
 def get_table(table, tidx):
     return table[tidx]
+
 
 # TODO: update for MVP
 def interpret_v12(host_import_func,
