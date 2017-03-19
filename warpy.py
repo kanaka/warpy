@@ -9,10 +9,6 @@ if IS_RPYTHON:
     def jitpolicy(driver):
         return JitPolicy()
     from rpython.rlib.jit import JitDriver, purefunction, unroll_safe
-    jitdriver = JitDriver(
-            greens=['opcode', 'pc', 'code', 'function', 'table',
-                    'block_map'],
-            reds=['memory', 'stack', 'localstack', 'blockstack'])
 
     from rpython.rtyper.lltypesystem import lltype
     from rpython.rtyper.lltypesystem.lloperation import llop
@@ -174,7 +170,10 @@ class FunctionImport(Code):
 
 MAGIC = 0x6d736100
 VERSION = 0xc
-BLOCKSTACK_MAX = 8192
+
+STACK_SIZE      = 65536
+LOCALSTACK_SIZE = 65536
+BLOCKSTACK_SIZE = 8192
 
 VALUE_TYPE = { 0x01 : I32,
                0x02 : I64,
@@ -487,12 +486,6 @@ def value_repr(val):
     else:
         raise Exception("unknown value type %s" % val.TYPE_NAME)
 
-def stack_repr(vals):
-    return "[" + " ".join([value_repr(v) for v in vals]) + "]"
-
-def localstack_repr(vals):
-    return "[" + " ".join([value_repr(v) for v in vals]) + "]"
-
 def sig_repr(sig):
     if isinstance(sig, Block):
         return "%s<0->%d>" % (
@@ -503,9 +496,27 @@ def sig_repr(sig):
                 sig.index, len(sig.type.params),
                 len(sig.locals), len(sig.type.results))
 
-def blockstack_repr(vals):
-    return "[" + " ".join(["%s(ss:0x%x/ra:0x%x)" % (sig_repr(s),ss,ra)
-        for s,ss,ra in vals]) + "]"
+def stack_repr(sp, s):
+    return "[" + " ".join([value_repr(s[i])
+                           for i in range(sp+1)]) + "]"
+
+def localstack_repr(lsp, ls):
+    return "[" + " ".join([value_repr(ls[i])
+                           for i in range(lsp+1)]) + "]"
+
+def blockstack_repr(bsp, bs):
+    return "[" + " ".join(["%s(sp:0x%x/ra:0x%x)" % (
+        sig_repr(bs[i][0]),bs[i][1],bs[i][2])
+                           for i in range(bsp+1)]) + "]"
+
+def dump_stacks(sp, stack, lsp, localstack, bsp, blockstack):
+    if INFO:
+        trace("      * stack:       %s" % (
+            stack_repr(sp, stack)))
+        trace("      * localstack:  %s" % (
+            localstack_repr(lsp, localstack)))
+        trace("      * blockstack:  %s" % (
+            blockstack_repr(bsp, blockstack)))
 
 def byte_code_repr(bytes):
     res = []
@@ -592,63 +603,69 @@ def find_blocks(code, start, end, block_map):
     return block_map
 
 @unroll_safe
-def pop_sig(stack, localstack, blockstack):
-    block, stacksize, ra = blockstack.pop()
+def pop_sig(sp, stack, lsp, localstack, bsp, blockstack):
+    block, orig_sp, ra = blockstack[bsp]
+    bsp -= 1
     t = block.type
     local_cnt = len(block.type.params) + len(block.locals)
 
-    # Restore local stack
-    for i in range(local_cnt):
-        localstack.pop()
+    # Restore localstack
+    lsp -= local_cnt
 
     # Validate return value if there is one
     if len(t.results) > 1:
         raise Exception("multiple return values unimplemented")
-    if len(stack) < len(t.results):
+    if len(t.results) > sp+1:
         raise Exception("stack underflow")
 
     if len(t.results) == 1:
         # Restore main value stack, saving top return value
-        save = stack.pop()
+        save = stack[sp]
+        sp -= 1
         if not isinstance(save, t.results[0]):
             raise WAException("call signature mismatch: %s != %s" % (
                 t.results[0].TYPE_NAME, save.TYPE_NAME))
 
         # Restore value stack to original size prior to call/block
-        while len(stack) > stacksize:
-            stack.pop()
+        if orig_sp < sp:
+            sp = orig_sp
 
         # Put back return value if we have one
-        stack.append(save)
+        sp += 1
+        stack[sp] = save
     else:
         # Restore value stack to original size prior to call/block
-        while len(stack) > stacksize:
-            stack.pop()
+        if orig_sp < sp:
+            sp = orig_sp
 
-    return block, ra
+    return block, ra, sp, lsp, bsp
 
-def do_branch(stack, localstack, blockstack, depth):
-    assert len(blockstack) > depth
-    target_block, _, _ = blockstack[-1-depth]
+def do_branch(sp, stack, lsp, localstack, bsp, blockstack, depth):
+    assert bsp+1 > depth
+    target_block, _, _ = blockstack[bsp-depth]
     if isinstance(target_block, Block):
-        block, _ = pop_sig(stack, localstack, blockstack)
+        block, _, sp, lsp, bsp = pop_sig(
+                sp, stack, lsp, localstack, bsp, blockstack)
         for r in range(depth):
-            block, _ = pop_sig(stack, localstack, blockstack)
-        return block.br_addr
+            block, _, sp, lsp, bsp = pop_sig(
+                    sp, stack, lsp, localstack, bsp, blockstack)
+        return block.br_addr, sp, lsp, bsp
     else:
         for r in range(depth):
-            block, _ = pop_sig(stack, localstack, blockstack)
-        return target_block.end
+            block, _, sp, lsp, bsp = pop_sig(
+                    sp, stack, lsp, localstack, bsp, blockstack)
+        return target_block.end, sp, lsp, bsp
         #raise Exception("br* from function unimplemented")
 
-def do_call_import(stack, memory, host_import_func, func):
+def do_call_import(sp, stack, memory, host_import_func, func):
     t = func.type
 
     # make sure args match signature
     args = []
     for idx in range(len(t.params)-1, -1, -1):
         PType = t.params[idx]
-        arg = stack.pop()
+        arg = stack[sp]
+        sp -= 1
         if PType.TYPE_NAME != arg.TYPE_NAME:
             raise WAException("call signature mismatch: %s != %s" % (
                 PType.TYPE_NAME, arg.TYPE_NAME))
@@ -667,16 +684,19 @@ def do_call_import(stack, memory, host_import_func, func):
             assert isinstance(res, NumericValueType)
             if RType.TYPE_NAME != res.TYPE_NAME:
                 raise Exception("return signature mismatch")
-            stack.append(res)
+            sp += 1
+            stack[sp] = res
         else:
             raise Exception("return signature mismatch")
+    return sp
 
-def do_call(stack, localstack, blockstack, func, pc):
+def do_call(sp, stack, lsp, localstack, bsp, blockstack, func, pc):
 
-    # Push type, stack size and return address onto blockstack
+    # Push block, stack size and return address onto blockstack
     t = func.type
-    assert len(blockstack) < BLOCKSTACK_MAX, "call stack exhausted"
-    blockstack.append((func, len(stack), pc))
+    assert bsp < BLOCKSTACK_SIZE, "call stack exhausted"
+    bsp += 1
+    blockstack[bsp] = (func, sp, pc)
 
     # Update the pos/instruction counter to the function
     pc = func.start
@@ -694,17 +714,20 @@ def do_call(stack, localstack, blockstack, func, pc):
         elif LType.TYPE_NAME == "f32": val = F32(0.0)
         elif LType.TYPE_NAME == "f64": val = F64(0.0)
         else: raise Exception("invalid locals signature")
-        localstack.append(val)
+        lsp += 1
+        localstack[lsp] = val
 
     for tidx in range(len(t.params)-1, -1, -1):
         PType = t.params[tidx]
-        val = stack.pop()
+        val = stack[sp]
+        sp -= 1
         if PType.TYPE_NAME != val.TYPE_NAME:
             raise WAException("call signature mismatch: %s != %s" % (
                 PType.TYPE_NAME, val.TYPE_NAME))
-        localstack.append(val)
+        lsp += 1
+        localstack[lsp] = val
 
-    return pc
+    return pc, sp, lsp, bsp
 
 
 # Main loop/JIT
@@ -712,13 +735,6 @@ def do_call(stack, localstack, blockstack, func, pc):
 def get_location_str(opcode, pc, code, function, table, block_map):
     return "0x%x %s(0x%x)" % (
             pc, OPERATOR_INFO[opcode][0], opcode)
-
-if IS_RPYTHON:
-    jitdriver = JitDriver(
-            greens=['opcode', 'pc', 'code', 'function', 'table',
-                    'block_map'],
-            reds=['memory', 'stack', 'localstack', 'blockstack'],
-            get_printable_location=get_location_str)
 
 @purefunction
 def get_block(block_map, pc):
@@ -733,30 +749,40 @@ def get_table(table, tidx):
     return table[tidx]
 
 
+if IS_RPYTHON:
+    # greens/reds must be sorted: ints, refs, floats
+    jitdriver = JitDriver(
+            greens=['opcode', 'pc',
+                    'code', 'function', 'table', 'block_map'],
+            reds=['sp', 'lsp', 'bsp',
+                  'memory', 'stack', 'localstack', 'blockstack'],
+            get_printable_location=get_location_str)
+
 # TODO: update for MVP
 def interpret_v12(host_import_func,
         # Greens
         pc, code, function, table, block_map,
         # Reds
-        memory, stack, localstack, blockstack):
+        memory, sp, stack, lsp, localstack, bsp, blockstack):
 
     while pc < len(code):
         opcode = code[pc]
         if IS_RPYTHON:
             jitdriver.jit_merge_point(
+                    # Greens
                     opcode=opcode,
                     pc=pc,
                     code=code,
                     function=function,
                     table=table,
                     block_map=block_map,
-
+                    # Reds
                     memory=memory,
-                    stack=stack,
-                    localstack=localstack,
-                    blockstack=blockstack)
+                    sp=sp,   stack=stack,
+                    lsp=lsp, localstack=localstack,
+                    bsp=bsp, blockstack=blockstack)
 
-#        if TRACE: self.dump_stacks()
+#        if TRACE: dump_stacks(sp, stack, lsp, localstack, bsp, blockstack)
         cur_pc = pc
         pc += 1
 #        trace("    [0x%x %s (0x%x)] - " % (
@@ -768,54 +794,60 @@ def interpret_v12(host_import_func,
         elif 0x01 == opcode:  # block
             pc, ignore = read_LEB(code, pc, 32) # ignore block_type
             block = get_block(block_map, cur_pc)
-            blockstack.append((block, len(stack), 0))
+            bsp += 1
+            blockstack[bsp] = (block, sp, 0)
 #            trace("sig: %s at 0x%x" % (
 #                sig_repr(block), cur_pc))
         elif 0x02 == opcode:  # loop
             pc, ignore = read_LEB(code, pc, 32) # ignore block_type
             block = get_block(block_map, cur_pc)
-            blockstack.append((block, len(stack), 0))
+            bsp += 1
+            blockstack[bsp] = (block, sp, 0)
 #            trace("sig: %s at 0x%x" % (
 #                sig_repr(block), cur_pc))
         elif 0x03 == opcode:  # if
             pc, ignore = read_LEB(code, pc, 32) # ignore block_type
             block = get_block(block_map, cur_pc)
-            blockstack.append((block, len(stack), 0))
-            cond = stack.pop()
+            bsp += 1
+            blockstack[bsp] = (block, sp, 0)
+            cond = stack[sp]
+            sp -= 1
             if not cond.val:  # if false
                 # branch to else block or after end of if
                 if block.else_addr == 0:
                     # no else block so pop if block
-                    blockstack.pop()
+                    bsp -= 1
                     pc = block.br_addr
                 else:
                     pc = block.else_addr
 #            trace("cond: %s jump to 0x%x, sig: %s at 0x%x" % (
 #                value_repr(cond), pc, sig_repr(block), cur_pc))
         elif 0x04 == opcode:  # else
-            block, _ = pop_sig(stack, localstack, blockstack)
+            block, _, sp, lsp, bsp = pop_sig(
+                    sp, stack, lsp, localstack, bsp, blockstack)
             pc = block.br_addr
 #            trace("of %s jump to 0x%x" % (sig_repr(block), pc))
         elif 0x05 == opcode:  # select
-            cond = stack.pop()
-            a, b = stack.pop(), stack.pop()
+            cond, a, b = stack[sp], stack[sp-1], stack[sp-2]
+            sp -= 2
             if cond.val:
-                stack.append(b)
+                stack[sp] = b
             else:
-                stack.append(a)
+                stack[sp] = a
         elif 0x06 == opcode:  # br
             pc, relative_depth = read_LEB(code, pc, 32)
-            pc = do_branch(stack, localstack, blockstack,
-                    relative_depth)
+            pc, sp, lsp, bsp = do_branch(sp, stack, lsp, localstack,
+                    bsp, blockstack, relative_depth)
 #            trace("depth: 0x%x, to: 0x%x" % (relative_depth, pc))
         elif 0x07 == opcode:  # br_if
             pc, relative_depth = read_LEB(code, pc, 32)
-            cond = stack.pop()
+            cond = stack[sp]
+            sp -= 1
 #            trace("cond: %s, depth: 0x%x" % (
 #                value_repr(cond), relative_depth))
             if cond.val:
-                pc = do_branch(stack, localstack, blockstack,
-                        relative_depth)
+                pc, sp, lsp, bsp = do_branch(sp, stack, lsp, localstack,
+                        bsp, blockstack, relative_depth)
         elif 0x08 == opcode:  # br_table
             pc, target_count = read_LEB(code, pc, 32)
             depths = []
@@ -823,24 +855,27 @@ def interpret_v12(host_import_func,
                 pc, depth = read_LEB(code, pc, 32)
                 depths.append(depth)
             pc, depth = read_LEB(code, pc, 32) # default
-            expr = stack.pop()
+            expr = stack[sp]
+            sp -= 1
             assert isinstance(expr, I32)
             didx = int(expr.val)
             if didx >= 0 and didx < len(depths):
                 depth = depths[didx]
 #            trace("depths: %s, index: %d, choosen depth: 0x%x" % (
 #                depths, didx, depth))
-            pc = do_branch(stack, localstack, blockstack, depth)
+            pc, sp, lsp, bsp = do_branch(sp, stack, lsp, localstack,
+                    bsp, blockstack, depth)
         elif 0x09 == opcode:  # return
             # Pop blocks until reach Function signature
-            while len(blockstack) > 0:
-                if isinstance(blockstack[-1][0], Function): break
+            while bsp >= 0:
+                if isinstance(blockstack[bsp][0], Function): break
                 # We don't use pop_sig because the end opcode
                 # handler will do this for us and catch the return
                 # value properly.
-                block = blockstack.pop()
-            assert len(blockstack) > 0
-            block = blockstack[-1][0]
+                block = blockstack[bsp]
+                bsp -= 1
+            assert bsp >= 0
+            block = blockstack[bsp][0]
             assert isinstance(block, Function)
             # Set instruction pointer to end of function
             # The actual pop_sig and return is handled by handling
@@ -851,17 +886,18 @@ def interpret_v12(host_import_func,
 #            trace("")
             pass
         elif 0x0b == opcode:  # drop
-#            trace("%s" % value_repr(stack[-1]))
-            stack.pop()
+#            trace("%s" % value_repr(stack[sp]))
+            sp -= 1
         elif 0x0f == opcode:  # end
-            block, ra = pop_sig(stack, localstack, blockstack)
+            block, ra, sp, lsp, bsp = pop_sig(
+                    sp, stack, lsp, localstack, bsp, blockstack)
 #            trace("of %s" % sig_repr(block))
             if isinstance(block, Function):
                 # Return to return address
                 pc = ra
-                if len(blockstack) == 0:
+                if bsp == -1:
                     # Return to top-level, ignoring return_addr
-                    return pc
+                    return pc, sp
                 else:
                     if DEBUG:
 #                        trace("  Returning from function %d to %d" % (
@@ -869,40 +905,46 @@ def interpret_v12(host_import_func,
                         pass
             elif isinstance(block, Block) and block.kind == 0x00:
                 # this is an init_expr
-                return pc
+                return pc, sp
             else:
                 pass # end of block/loop/if, keep going
         elif 0x10 == opcode:  # i32.const
             pc, val = read_LEB(code, pc, 32, signed=True)
-            stack.append(I32(int(val)))
-#            trace("%s" % value_repr(stack[-1]))
+            sp += 1
+            stack[sp] = I32(int(val))
+#            trace("%s" % value_repr(stack[sp]))
         elif 0x11 == opcode:  # i64.const
             pc, val = read_LEB(code, pc, 64, signed=True)
-            stack.append(I64(val))
-#            trace("%s" % value_repr(stack[-1]))
+            sp += 1
+            stack[sp] = I64(val)
+#            trace("%s" % value_repr(stack[sp]))
         elif 0x12 == opcode:  # f64.const
             bytes = code[pc:pc+8]
             pc += 8
-            stack.append(F64(read_F64(bytes)))
-#            trace("%s" % value_repr(stack[-1]))
+            sp += 1
+            stack[sp] = F64(read_F64(bytes))
+#            trace("%s" % value_repr(stack[sp]))
         elif 0x13 == opcode:  # f32.const
             bytes = code[pc:pc+4]
             pc += 4
-            stack.append(F32(read_F32(bytes)))
-#            trace("%s" % value_repr(stack[-1]))
+            sp += 1
+            stack[sp] = F32(read_F32(bytes))
+#            trace("%s" % value_repr(stack[sp]))
         elif 0x14 == opcode:  # get_local
             pc, arg = read_LEB(code, pc, 32)
 #            trace("0x%x" % arg)
-            stack.append(localstack[-1-arg])
+            sp += 1
+            stack[sp] = localstack[lsp-arg]
         elif 0x15 == opcode:  # set_local
             pc, arg = read_LEB(code, pc, 32)
-            val = stack.pop()
-            localstack[-1-arg] = val
+            val = stack[sp]
+            sp -= 1
+            localstack[lsp-arg] = val
 #            trace("0x%x to %s" % (arg, value_repr(val)))
         elif 0x19 == opcode:  # tee_local
             pc, arg = read_LEB(code, pc, 32)
-            val = stack[-1] # like set_local but do not pop
-            localstack[-1-arg] = val
+            val = stack[sp] # like set_local but do not pop
+            localstack[lsp-arg] = val
 #            trace("0x%x to %s" % (arg, value_repr(val)))
         elif 0xbb == opcode:  # get_global
             raise Exception("get_global unimplemented")
@@ -917,14 +959,17 @@ def interpret_v12(host_import_func,
 #                trace("calling import %s.%s(%s)" % (
 #                    func.module, func.field,
 #                    ",".join([a.TYPE_NAME for a in t.params])))
-                do_call_import(stack, memory, host_import_func, func)
+                sp = do_call_import(sp, stack,
+                        memory, host_import_func, func)
             elif isinstance(func, Function):
 #                trace("calling function fidx: %d" % fidx)
-                pc = do_call(stack, localstack, blockstack, func, pc)
+                pc, sp, lsp, bsp = do_call(sp, stack, lsp, localstack,
+                        bsp, blockstack, func, pc)
         elif 0x17 == opcode:  # call_indirect
             # TODO: what do we do with tidx?
             pc, tidx = read_LEB(code, pc, 32)
-            table_index_val = stack.pop()
+            table_index_val = stack[sp]
+            sp -= 1
             assert isinstance(table_index_val, I32)
             table_index = int(table_index_val.val)
             tbl = get_table(table, 0x20) # TODO: fix 0x20 for MVP
@@ -933,8 +978,8 @@ def interpret_v12(host_import_func,
             fidx = tbl[table_index]
 #            trace("table idx: 0x%x, tidx: 0x%x, calling function fidx: 0x%x" % (
 #                table_index, tidx, fidx))
-            pc = do_call(stack, localstack, blockstack,
-                    get_function(function, fidx), pc)
+            pc, sp, lsp, bsp = do_call(sp, stack, lsp, localstack,
+                    bsp, blockstack, get_function(function, fidx), pc)
 
         # Memory immediates
         elif 0x20 <= opcode <= 0x36:
@@ -950,7 +995,8 @@ def interpret_v12(host_import_func,
 
         # i32 unary operations
         elif opcode in [0x57, 0x58, 0x59, 0x5a]:
-            a = stack.pop()
+            a = stack[sp]
+            sp -= 1
             assert isinstance(a, I32)
             if   0x58 == opcode: # i32.ctz
                 count = 0
@@ -966,11 +1012,13 @@ def interpret_v12(host_import_func,
                         % OPERATOR_INFO[opcode][0])
 #            trace("(%s) = %s" % (
 #                value_repr(a), value_repr(res)))
-            stack.append(res)
+            sp += 1
+            stack[sp] = res
 
         # i32 binary operations
         elif 0x40 <= opcode <= 0x5a or opcode in [0xb6, 0xb7]:
-            b, a = stack.pop(), stack.pop()
+            b, a = stack[sp], stack[sp-1]
+            sp -= 2
             assert isinstance(a, I32) and isinstance(b, I32)
             if   0x40 == opcode: # i32.add
                 res = I32(int(a.val + b.val))
@@ -996,11 +1044,13 @@ def interpret_v12(host_import_func,
 
 #            trace("(%s, %s) = %s" % (
 #                value_repr(a), value_repr(b), value_repr(res)))
-            stack.append(res)
+            sp += 1
+            stack[sp] = res
 
         # i64 unary operations
         elif opcode in [0x72, 0x73, 0x74, 0xba]:
-            a = stack.pop()
+            a = stack[sp]
+            sp -= 1
             assert isinstance(a, I64)
             if   0xba == opcode: # i64.eqz
                 res = I32(int(a.val == 0))
@@ -1009,11 +1059,13 @@ def interpret_v12(host_import_func,
                         % OPERATOR_INFO[opcode][0])
 #            trace("(%s) = %s" % (
 #                value_repr(a), value_repr(res)))
-            stack.append(res)
+            sp += 1
+            stack[sp] = res
 
         # i64 binary operations
         elif 0x5b <= opcode <= 0x74 or opcode in [0xb8, 0xb9]:
-            b, a = stack.pop(), stack.pop()
+            b, a = stack[sp], stack[sp-1]
+            sp -= 2
             assert isinstance(a, I64) and isinstance(b, I64)
             if   0x5b == opcode: # i64.add
                 res = I64(int(a.val + b.val))
@@ -1037,11 +1089,13 @@ def interpret_v12(host_import_func,
 
 #            trace("(%s, %s) = %s" % (
 #                value_repr(a), value_repr(b), value_repr(res)))
-            stack.append(res)
+            sp += 1
+            stack[sp] = res
 
         # f32 unary operations
         elif opcode in [0x7b, 0x7c]:
-            a = stack.pop()
+            a = stack[sp]
+            sp -= 1
             assert isinstance(a, F32)
             if   0x7b == opcode: # f32.abs
                 res = F32(abs(a.val))
@@ -1052,11 +1106,13 @@ def interpret_v12(host_import_func,
                         % OPERATOR_INFO[opcode][0])
 #            trace("(%s) = %s" % (
 #                value_repr(a), value_repr(res)))
-            stack.append(res)
+            sp += 1
+            stack[sp] = res
 
         # f32 binary operations
         elif 0x75 <= opcode <= 0x88:
-            b, a = stack.pop(), stack.pop()
+            b, a = stack[sp], stack[sp-1]
+            sp -= 2
             assert isinstance(a, F32) and isinstance(b, F32)
             if   0x75 == opcode: # f32.add
                 res = F32(float(a.val + b.val))
@@ -1078,11 +1134,13 @@ def interpret_v12(host_import_func,
 
 #            trace("(%s, %s) = %s" % (
 #                value_repr(a), value_repr(b), value_repr(res)))
-            stack.append(res)
+            sp += 1
+            stack[sp] = res
 
         # f64 unary operations
         elif opcode in [0x8f, 0x90]:
-            a = stack.pop()
+            a = stack[sp]
+            sp -= 1
             assert isinstance(a, F64)
             if   0x8f == opcode: # f32.abs
                 res = F64(abs(a.val))
@@ -1093,11 +1151,13 @@ def interpret_v12(host_import_func,
                         % OPERATOR_INFO[opcode][0])
 #            trace("(%s) = %s" % (
 #                value_repr(a), value_repr(res)))
-            stack.append(res)
+            sp += 1
+            stack[sp] = res
 
         # f64 binary operations
         elif 0x89 <= opcode <= 0x9c:
-            b, a = stack.pop(), stack.pop()
+            b, a = stack[sp], stack[sp-1]
+            sp -= 2
             assert isinstance(a, F64) and isinstance(b, F64)
             if   0x89 == opcode: # f64.add
                 res = F64(float(a.val + b.val))
@@ -1109,80 +1169,99 @@ def interpret_v12(host_import_func,
 
 #            trace("(%s, %s) = %s" % (
 #                value_repr(a), value_repr(b), value_repr(res)))
-            stack.append(res)
+            sp += 1
+            stack[sp] = res
 
         ## conversion operations
         #elif 0x9d <= opcode <= 0xb5:
 
         # conversion operations
         elif 0xa1 == opcode: # i32.wrap/i64
-            a = stack.pop()
+            a = stack[sp]
+            sp -= 1
             assert isinstance(a, I64)
             res = I32(int(a.val))
 #            trace("(%s) = %s" % (
 #                value_repr(a), value_repr(res)))
-            stack.append(res)
+            sp += 1
+            stack[sp] = res
         elif 0xa3 == opcode: # i64.trunc_s/f64
-            a = stack.pop()
+            a = stack[sp]
+            sp -= 1
             assert isinstance(a, F64)
             res = I64(int(a.val))
 #            trace("(%s) = %s" % (
 #                value_repr(a), value_repr(res)))
-            stack.append(res)
+            sp += 1
+            stack[sp] = res
         elif 0xa6 == opcode: # i64.extend_s/i32
-            a = stack.pop()
+            a = stack[sp]
+            sp -= 1
             assert isinstance(a, I32)
             res = I64(int(a.val))
 #            trace("(%s) = %s" % (
 #                value_repr(a), value_repr(res)))
-            stack.append(res)
+            sp += 1
+            stack[sp] = res
         elif 0xa7 == opcode: # i64.extend_u/i32
-            a = stack.pop()
+            a = stack[sp]
+            sp -= 1
             assert isinstance(a, I32)
             res = I64(int(a.val))
 #            trace("(%s) = %s" % (
 #                value_repr(a), value_repr(res)))
-            stack.append(res)
+            sp += 1
+            stack[sp] = res
         elif 0xae == opcode: # f64.convert_s/i32
-            a = stack.pop()
+            a = stack[sp]
+            sp -= 1
             assert isinstance(a, I32)
             res = F64(float(a.val))
 #            trace("(%s) = %s" % (
 #                value_repr(a), value_repr(res)))
-            stack.append(res)
+            sp += 1
+            stack[sp] = res
         elif 0xaf == opcode: # f64.convert_u/i32
-            a = stack.pop()
+            a = stack[sp]
+            sp -= 1
             assert isinstance(a, I32)
             res = F64(float(a.val))
 #            trace("(%s) = %s" % (
 #                value_repr(a), value_repr(res)))
-            stack.append(res)
+            sp += 1
+            stack[sp] = res
         elif 0xb0 == opcode: # f64.convert_s/i64
-            a = stack.pop()
+            a = stack[sp]
+            sp -= 1
             assert isinstance(a, I64)
             res = F64(float(a.val))
 #            trace("(%s) = %s" % (
 #                value_repr(a), value_repr(res)))
-            stack.append(res)
+            sp += 1
+            stack[sp] = res
         elif 0xb1 == opcode: # f64.convert_u/i64
-            a = stack.pop()
+            a = stack[sp]
+            sp -= 1
             assert isinstance(a, I64)
             res = F64(float(a.val))
 #            trace("(%s) = %s" % (
 #                value_repr(a), value_repr(res)))
-            stack.append(res)
+            sp += 1
+            stack[sp] = res
         elif 0xb2 == opcode: # f64.promote/f32
-            a = stack.pop()
+            a = stack[sp]
+            sp -= 1
             assert isinstance(a, F32)
             res = F64(float(a.val))
 #            trace("(%s) = %s" % (
 #                value_repr(a), value_repr(res)))
-            stack.append(res)
+            sp += 1
+            stack[sp] = res
 
         else:
             raise Exception("unrecognized opcode %d" % opcode)
 
-    return pc
+    return pc, sp
 
 
 ######################################
@@ -1299,18 +1378,13 @@ class Module():
         self.block_map = {}
 
         # Execution state
-        self.stack = []
-        self.localstack = []
-        self.blockstack = []
-
-    def dump_stacks(self):
-        if INFO:
-            trace("      * stack:       %s" % (
-                stack_repr(self.stack)))
-            trace("      * localstack:  %s" % (
-                localstack_repr(self.localstack)))
-            trace("      * blockstack:    %s" % (
-                blockstack_repr(self.blockstack)))
+        self.sp = -1
+        self.stack = [NumericValueType()] * STACK_SIZE
+        self.lsp = -1
+        self.localstack = [NumericValueType()] * LOCALSTACK_SIZE
+        self.bsp = -1
+        block = Block(0x00, BLOCK_TYPE[0x01], 0)
+        self.blockstack = [(block, 0, 0)] * BLOCKSTACK_SIZE
 
     def dump(self):
         #debug("raw module data: %s" % self.data)
@@ -1522,10 +1596,12 @@ class Module():
 
             # Run the init_expr
             block = Block(0x00, BLOCK_TYPE[0x01], self.rdr.pos)
-            self.blockstack.append((block, len(self.stack), 0))
+            self.bsp += 1
+            self.blockstack[self.bsp] = (block, self.sp, 0)
             # WARNING: running code here to get offset!
-            self.interpret()
-            offset_val = self.stack.pop()
+            self.interpret()  # run iter_expr
+            offset_val = self.stack[self.sp]
+            self.sp -= 1
             assert isinstance(offset_val, I32)
             offset = int(offset_val.val)
 
@@ -1571,20 +1647,20 @@ class Module():
 
 
     def interpret(self):
-        self.rdr.pos = interpret_v12(self.host_import_func,
+        self.rdr.pos, self.sp = interpret_v12(self.host_import_func,
                 # Greens
                 self.rdr.pos, self.rdr.bytes, self.function,
                 self.table, self.block_map,
                 # Reds
-                self.memory, self.stack, self.localstack,
-                self.blockstack)
+                self.memory, self.sp, self.stack,
+                self.lsp, self.localstack, self.bsp, self.blockstack)
 
 
     def run(self, name, args):
         # Reset stacks
-        self.stack = []
-        self.localstack = []
-        self.blockstack = []
+        self.sp  = -1
+        self.lsp = -1
+        self.bsp = -1
 
         fidx = self.export_map[name].index
 
@@ -1605,17 +1681,23 @@ class Module():
             elif tname == "f64": val = F64(float(arg))
             else: raise Exception("invalid argument %d: %s" % (
                 idx, arg))
-            self.stack.append(val)
+            self.sp += 1
+            self.stack[self.sp] = val
 
         info("Running function %s (0x%x)" % (name, fidx))
-        self.dump_stacks()
-        self.rdr.pos = do_call(self.stack, self.localstack,
-                self.blockstack, self.function[fidx],
-                len(self.rdr.bytes))
+        dump_stacks(self.sp, self.stack, self.lsp, self.localstack,
+                self.bsp, self.blockstack)
+        self.rdr.pos, self.sp, self.lsp, self.bsp = do_call(
+                self.sp, self.stack,
+                self.lsp, self.localstack,
+                self.bsp, self.blockstack,
+                self.function[fidx], len(self.rdr.bytes))
 
         self.interpret()
-        if len(self.stack) > 0:
-            return self.stack.pop()
+        if self.sp >= 0:
+            ret = self.stack[self.sp]
+            self.sp -= 1
+            return ret
         else:
             return None
 
