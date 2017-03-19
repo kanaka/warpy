@@ -174,6 +174,9 @@ def run_test_file(test_file):
             elif re.match("^\(assert_invalid\\b.*", form):
                 #print("ignoring assert_invalid")
                 pass
+            elif re.match("^\(assert_exhaustion\\b.*", form):
+                print("ignoring assert_exhaustion")
+                pass
             else:
                 raise Exception("unrecognized form '%s...'" % form[0:20])
     finally:

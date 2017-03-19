@@ -8,12 +8,11 @@ if IS_RPYTHON:
     from rpython.jit.codewriter.policy import JitPolicy
     def jitpolicy(driver):
         return JitPolicy()
-    from rpython.rlib.jit import JitDriver, purefunction
+    from rpython.rlib.jit import JitDriver, purefunction, unroll_safe
     jitdriver = JitDriver(
             greens=['opcode', 'pc', 'code', 'function', 'table',
                     'block_map'],
-            reds=['memory', 'stack', 'localstack', 'blockstack',
-                  'returnstack'])
+            reds=['memory', 'stack', 'localstack', 'blockstack'])
 
     from rpython.rtyper.lltypesystem import lltype
     from rpython.rtyper.lltypesystem.lloperation import llop
@@ -47,6 +46,7 @@ else:
     import struct
 
     def purefunction(f): return f
+    def unroll_safe(f): return f
 
     def do_sort(a):
         a.sort()
@@ -58,9 +58,6 @@ else:
 
     def fround(val, digits):
         return round(val, digits)
-
-# TODO: do we need to track the stack size at each block/call and
-# discard extras from the stack?
 
 INFO  = True   # informational logging
 DEBUG = False  # verbose logging
@@ -177,7 +174,7 @@ class FunctionImport(Code):
 
 MAGIC = 0x6d736100
 VERSION = 0xc
-CALLSTACK_MAX = 1024
+BLOCKSTACK_MAX = 8192
 
 VALUE_TYPE = { 0x01 : I32,
                0x02 : I64,
@@ -507,10 +504,8 @@ def sig_repr(sig):
                 len(sig.locals), len(sig.type.results))
 
 def blockstack_repr(vals):
-    return "[" + " ".join(["%s(%d)" % (sig_repr(s),ss) for s,ss in vals]) + "]"
-
-def returnstack_repr(vals):
-    return "[" + " ".join([str(v) for v in vals]) + "]"
+    return "[" + " ".join(["%s(ss:0x%x/ra:0x%x)" % (sig_repr(s),ss,ra)
+        for s,ss,ra in vals]) + "]"
 
 def byte_code_repr(bytes):
     res = []
@@ -596,9 +591,9 @@ def find_blocks(code, start, end, block_map):
 
     return block_map
 
-
+@unroll_safe
 def pop_sig(stack, localstack, blockstack):
-    block, stacksize = blockstack.pop()
+    block, stacksize, ra = blockstack.pop()
     t = block.type
     local_cnt = len(block.type.params) + len(block.locals)
 
@@ -630,19 +625,19 @@ def pop_sig(stack, localstack, blockstack):
         while len(stack) > stacksize:
             stack.pop()
 
-    return block
+    return block, ra
 
 def do_branch(stack, localstack, blockstack, depth):
     assert len(blockstack) > depth
-    target_block, stack_size = blockstack[-1-depth]
+    target_block, _, _ = blockstack[-1-depth]
     if isinstance(target_block, Block):
-        block = pop_sig(stack, localstack, blockstack)
+        block, _ = pop_sig(stack, localstack, blockstack)
         for r in range(depth):
-            block = pop_sig(stack, localstack, blockstack)
+            block, _ = pop_sig(stack, localstack, blockstack)
         return block.br_addr
     else:
         for r in range(depth):
-            block = pop_sig(stack, localstack, blockstack)
+            block, _ = pop_sig(stack, localstack, blockstack)
         return target_block.end
         #raise Exception("br* from function unimplemented")
 
@@ -676,15 +671,12 @@ def do_call_import(stack, memory, host_import_func, func):
         else:
             raise Exception("return signature mismatch")
 
-def do_call(stack, localstack, blockstack, returnstack, func, pc):
+def do_call(stack, localstack, blockstack, func, pc):
 
-    # Push type onto blockstack
+    # Push type, stack size and return address onto blockstack
     t = func.type
-    blockstack.append((func, len(stack)))
-
-    # Push return address onto returnstack
-    assert len(returnstack) < CALLSTACK_MAX, "call stack exhausted"
-    returnstack.append(pc)
+    assert len(blockstack) < BLOCKSTACK_MAX, "call stack exhausted"
+    blockstack.append((func, len(stack), pc))
 
     # Update the pos/instruction counter to the function
     pc = func.start
@@ -725,8 +717,7 @@ if IS_RPYTHON:
     jitdriver = JitDriver(
             greens=['opcode', 'pc', 'code', 'function', 'table',
                     'block_map'],
-            reds=['memory', 'stack', 'localstack', 'blockstack',
-                  'returnstack'],
+            reds=['memory', 'stack', 'localstack', 'blockstack'],
             get_printable_location=get_location_str)
 
 @purefunction
@@ -747,7 +738,7 @@ def interpret_v12(host_import_func,
         # Greens
         pc, code, function, table, block_map,
         # Reds
-        memory, stack, localstack, blockstack, returnstack):
+        memory, stack, localstack, blockstack):
 
     while pc < len(code):
         opcode = code[pc]
@@ -763,8 +754,7 @@ def interpret_v12(host_import_func,
                     memory=memory,
                     stack=stack,
                     localstack=localstack,
-                    blockstack=blockstack,
-                    returnstack=returnstack)
+                    blockstack=blockstack)
 
 #        if TRACE: self.dump_stacks()
         cur_pc = pc
@@ -778,19 +768,19 @@ def interpret_v12(host_import_func,
         elif 0x01 == opcode:  # block
             pc, ignore = read_LEB(code, pc, 32) # ignore block_type
             block = get_block(block_map, cur_pc)
-            blockstack.append((block, len(stack)))
+            blockstack.append((block, len(stack), 0))
 #            trace("sig: %s at 0x%x" % (
 #                sig_repr(block), cur_pc))
         elif 0x02 == opcode:  # loop
             pc, ignore = read_LEB(code, pc, 32) # ignore block_type
             block = get_block(block_map, cur_pc)
-            blockstack.append((block, len(stack)))
+            blockstack.append((block, len(stack), 0))
 #            trace("sig: %s at 0x%x" % (
 #                sig_repr(block), cur_pc))
         elif 0x03 == opcode:  # if
             pc, ignore = read_LEB(code, pc, 32) # ignore block_type
             block = get_block(block_map, cur_pc)
-            blockstack.append((block, len(stack)))
+            blockstack.append((block, len(stack), 0))
             cond = stack.pop()
             if not cond.val:  # if false
                 # branch to else block or after end of if
@@ -803,7 +793,7 @@ def interpret_v12(host_import_func,
 #            trace("cond: %s jump to 0x%x, sig: %s at 0x%x" % (
 #                value_repr(cond), pc, sig_repr(block), cur_pc))
         elif 0x04 == opcode:  # else
-            block = pop_sig(stack, localstack, blockstack)
+            block, _ = pop_sig(stack, localstack, blockstack)
             pc = block.br_addr
 #            trace("of %s jump to 0x%x" % (sig_repr(block), pc))
         elif 0x05 == opcode:  # select
@@ -845,7 +835,7 @@ def interpret_v12(host_import_func,
             # Pop blocks until reach Function signature
             while len(blockstack) > 0:
                 if isinstance(blockstack[-1][0], Function): break
-                # We don't use sig_pop because the end opcode
+                # We don't use pop_sig because the end opcode
                 # handler will do this for us and catch the return
                 # value properly.
                 block = blockstack.pop()
@@ -853,7 +843,7 @@ def interpret_v12(host_import_func,
             block = blockstack[-1][0]
             assert isinstance(block, Function)
             # Set instruction pointer to end of function
-            # The actual sig_pop and return is handled by handling
+            # The actual pop_sig and return is handled by handling
             # the end opcode
             pc = block.end
 #            trace("to 0x%x" % block.br_addr)
@@ -864,12 +854,12 @@ def interpret_v12(host_import_func,
 #            trace("%s" % value_repr(stack[-1]))
             stack.pop()
         elif 0x0f == opcode:  # end
-            block = pop_sig(stack, localstack, blockstack)
+            block, ra = pop_sig(stack, localstack, blockstack)
 #            trace("of %s" % sig_repr(block))
             if isinstance(block, Function):
                 # Return to return address
-                pc = returnstack.pop()
-                if len(returnstack) == 0:
+                pc = ra
+                if len(blockstack) == 0:
                     # Return to top-level, ignoring return_addr
                     return pc
                 else:
@@ -891,8 +881,8 @@ def interpret_v12(host_import_func,
             stack.append(I64(val))
 #            trace("%s" % value_repr(stack[-1]))
         elif 0x12 == opcode:  # f64.const
-            bytes = code[pc:pc+4]
-            pc += 4
+            bytes = code[pc:pc+8]
+            pc += 8
             stack.append(F64(read_F64(bytes)))
 #            trace("%s" % value_repr(stack[-1]))
         elif 0x13 == opcode:  # f32.const
@@ -930,8 +920,7 @@ def interpret_v12(host_import_func,
                 do_call_import(stack, memory, host_import_func, func)
             elif isinstance(func, Function):
 #                trace("calling function fidx: %d" % fidx)
-                pc = do_call(stack, localstack, blockstack,
-                        returnstack, func, pc)
+                pc = do_call(stack, localstack, blockstack, func, pc)
         elif 0x17 == opcode:  # call_indirect
             # TODO: what do we do with tidx?
             pc, tidx = read_LEB(code, pc, 32)
@@ -944,7 +933,7 @@ def interpret_v12(host_import_func,
             fidx = tbl[table_index]
 #            trace("table idx: 0x%x, tidx: 0x%x, calling function fidx: 0x%x" % (
 #                table_index, tidx, fidx))
-            pc = do_call(stack, localstack, blockstack, returnstack,
+            pc = do_call(stack, localstack, blockstack,
                     get_function(function, fidx), pc)
 
         # Memory immediates
@@ -1312,7 +1301,6 @@ class Module():
         # Execution state
         self.stack = []
         self.localstack = []
-        self.returnstack = []
         self.blockstack = []
 
     def dump_stacks(self):
@@ -1323,8 +1311,6 @@ class Module():
                 localstack_repr(self.localstack)))
             trace("      * blockstack:    %s" % (
                 blockstack_repr(self.blockstack)))
-            trace("      * returnstack: %s" % (
-                returnstack_repr(self.returnstack)))
 
     def dump(self):
         #debug("raw module data: %s" % self.data)
@@ -1536,7 +1522,7 @@ class Module():
 
             # Run the init_expr
             block = Block(0x00, BLOCK_TYPE[0x01], self.rdr.pos)
-            self.blockstack.append((block, len(self.stack)))
+            self.blockstack.append((block, len(self.stack), 0))
             # WARNING: running code here to get offset!
             self.interpret()
             offset_val = self.stack.pop()
@@ -1591,14 +1577,13 @@ class Module():
                 self.table, self.block_map,
                 # Reds
                 self.memory, self.stack, self.localstack,
-                self.blockstack, self.returnstack)
+                self.blockstack)
 
 
     def run(self, name, args):
         # Reset stacks
         self.stack = []
         self.localstack = []
-        self.returnstack = []
         self.blockstack = []
 
         fidx = self.export_map[name].index
@@ -1625,8 +1610,8 @@ class Module():
         info("Running function %s (0x%x)" % (name, fidx))
         self.dump_stacks()
         self.rdr.pos = do_call(self.stack, self.localstack,
-                self.blockstack, self.returnstack,
-                self.function[fidx], len(self.rdr.bytes))
+                self.blockstack, self.function[fidx],
+                len(self.rdr.bytes))
 
         self.interpret()
         if len(self.stack) > 0:
