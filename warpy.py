@@ -71,53 +71,6 @@ class WAException(Exception):
     def __init__(self, message):
         self.message = message
 
-class ValueType():
-    pass
-
-class Empty(ValueType):
-    pass
-
-class NumericValueType(ValueType):
-    TYPE_NAME = "empty"
-
-class I32(NumericValueType):
-    TYPE_NAME = "i32"
-    def __init__(self, val):
-        assert isinstance(val, int)
-        self.val = val
-
-class I64(NumericValueType):
-    TYPE_NAME = "i64"
-    def __init__(self, val):
-        if isinstance(val, int):
-            self.val = val
-        elif isinstance(val, long):
-            self.val = val & 0xffffffffffffffff
-        else:
-            raise Exception("invalid I64 value")
-
-class F32(NumericValueType):
-    TYPE_NAME = "f32"
-    def __init__(self, val):
-        assert isinstance(val, float)
-        #self.val = fround(val, 5) # passes func, fails loop at nesting(7.0, 4.0)
-        self.val = fround(val, 6) # fails func at value-f32, fails loops at nesting(7.0, 100.0)
-
-class F64(NumericValueType):
-    TYPE_NAME = "f64"
-    def __init__(self, val):
-        assert isinstance(val, float)
-        self.val = val
-
-class AnyFunc(ValueType):
-    TYPE_NAME = "anyfunc"
-
-class Func(ValueType):
-    TYPE_NAME = "func"
-
-class EmptyBlockType(ValueType):
-    TYPE_NAME = "emtpy_block_type"
-
 class Type():
     def __init__(self, index, form, params, results):
         self.index = index
@@ -175,20 +128,21 @@ VERSION = 0xc
 STACK_SIZE      = 65536
 BLOCKSTACK_SIZE = 8192
 
-VALUE_TYPE = { 0x01 : I32,
-               0x02 : I64,
-               0x03 : F32,
-               0x04 : F64,
-               0x10 : AnyFunc,
-               0x20 : Func,
-               0x40 : EmptyBlockType }
+VALUE_TYPE = { 0x01 : 'i32',
+               0x02 : 'i64',
+               0x03 : 'f32',
+               0x04 : 'f64',
+               0x10 : 'AnyFunc',
+               0x20 : 'Func',
+               0x40 : 'EmptyBlockType' }
 
 # Block signatures for blocks, loops, ifs
-BLOCK_TYPE = { 0x00 : Type(-1, Empty, [], []),
-               0x01 : Type(-1, Empty, [], [I32]),
-               0x02 : Type(-1, Empty, [], [I64]),
-               0x03 : Type(-1, Empty, [], [F32]),
-               0x04 : Type(-1, Empty, [], [F64]) }
+BLOCK_TYPE = { 0x00 : Type(-1, -1, [], []),
+               0x01 : Type(-1, -1, [], [0x01]),
+               0x02 : Type(-1, -1, [], [0x02]),
+               0x03 : Type(-1, -1, [], [0x03]),
+               0x04 : Type(-1, -1, [], [0x04]) }
+
 
 BLOCK_NAMES = { 0x00 : "fn",
                 0x01 : "block",
@@ -482,16 +436,14 @@ def read_F64(bytes):
     return unpack_f64(bits)
 
 def value_repr(val):
-    if isinstance(val,I32):
-        return "%s:%s" % (hex(int(val.val)), val.TYPE_NAME)
-    elif isinstance(val,I64):
-        return "%s:%s" % (hex(int(val.val)), val.TYPE_NAME)
-    elif isinstance(val,F32):
-        return "%f:%s" % (float(val.val), val.TYPE_NAME)
-    elif isinstance(val,F64):
-        return "%f:%s" % (float(val.val), val.TYPE_NAME)
+    vt, ival, fval = val
+    vtn = VALUE_TYPE[vt]
+    if   vtn in ('i32', 'i64'):
+        return "%s:%s" % (hex(ival), vtn)
+    elif vtn in ('f32', 'f64'):
+        return "%f:%s" % (fval, vtn)
     else:
-        raise Exception("unknown value type %s" % val.TYPE_NAME)
+        raise Exception("unknown value type %s" % vtn)
 
 def sig_repr(sig):
     if isinstance(sig, Block):
@@ -503,12 +455,12 @@ def sig_repr(sig):
                 sig.index, len(sig.type.params),
                 len(sig.locals), len(sig.type.results))
 
-def stack_repr(sp, fp, s):
+def stack_repr(sp, fp, stack):
     res = []
     for i in range(sp+1):
         if i == fp:
             res.append("*")
-        res.append(value_repr(s[i]))
+        res.append(value_repr(stack[i]))
     return "[" + " ".join(res) + "]"
 
 def blockstack_repr(bsp, bs):
@@ -623,9 +575,9 @@ def pop_sig(stack, blockstack, sp, fp, bsp):
         # Restore main value stack, saving top return value
         save = stack[sp]
         sp -= 1
-        if not isinstance(save, t.results[0]):
+        if save[0] != t.results[0]:
             raise WAException("call signature mismatch: %s != %s" % (
-                t.results[0].TYPE_NAME, save.TYPE_NAME))
+                VALUE_TYPE[t.results[0]], VALUE_TYPE[save[0]]))
 
         # Restore value stack to original size prior to call/block
         if orig_sp < sp:
@@ -670,21 +622,16 @@ def do_call(stack, blockstack, sp, fp, bsp, func, pc):
     # push locals (dropping extras)
     fp = sp - len(t.params) + 1
     for tidx in range(len(t.params)):
-        PType = t.params[tidx]
+        ptype = t.params[tidx]
         val = stack[fp+tidx]
-        if PType.TYPE_NAME != val.TYPE_NAME:
+        if ptype != val[0]:
             raise WAException("call signature mismatch: %s != %s" % (
-                PType.TYPE_NAME, val.TYPE_NAME))
+                VALUE_TYPE[ptype], VALUE_TYPE[val[0]]))
 
     for lidx in range(len(func.locals)):
-        LType = func.locals[lidx]
-        if   LType.TYPE_NAME == "i32": val = I32(0)
-        elif LType.TYPE_NAME == "i64": val = I64(0)
-        elif LType.TYPE_NAME == "f32": val = F32(0.0)
-        elif LType.TYPE_NAME == "f64": val = F64(0.0)
-        else: raise Exception("invalid locals signature")
+        ltype = func.locals[lidx]
         sp += 1
-        stack[sp] = val
+        stack[sp] = (ltype, 0, 0.0)
 
     return pc, sp, fp, bsp
 
@@ -696,26 +643,25 @@ def do_call_import(stack, sp, memory, host_import_func, func):
     # make sure args match signature
     args = []
     for idx in range(len(t.params)-1, -1, -1):
-        PType = t.params[idx]
+        ptype = t.params[idx]
         arg = stack[sp]
         sp -= 1
-        if PType.TYPE_NAME != arg.TYPE_NAME:
+        if ptype != arg[0]:
             raise WAException("call signature mismatch: %s != %s" % (
-                PType.TYPE_NAME, arg.TYPE_NAME))
+                VALUE_TYPE[ptype], VALUE_TYPE[arg[0]]))
         args.append(arg)
 
     # Workaround rpython failure to identify type
-    results = [I32(0)]
+    results = [(0, 0, 0.0)]
     results.pop()
     results.extend(host_import_func(memory,
             func.module, func.field, args))
 
     # make sure returns match signature
-    for idx, RType in enumerate(t.results):
+    for idx, rtype in enumerate(t.results):
         if idx < len(results):
             res = results[idx]
-            assert isinstance(res, NumericValueType)
-            if RType.TYPE_NAME != res.TYPE_NAME:
+            if rtype != res[0]:
                 raise Exception("return signature mismatch")
             sp += 1
             stack[sp] = res
@@ -808,7 +754,7 @@ def interpret_v12(module,
             blockstack[bsp] = (block, sp, fp, 0)
             cond = stack[sp]
             sp -= 1
-            if not cond.val:  # if false
+            if not cond[1]:  # if false (I32)
                 # branch to else block or after end of if
                 if block.else_addr == 0:
                     # no else block so pop if block and skip end
@@ -825,7 +771,7 @@ def interpret_v12(module,
         elif 0x05 == opcode:  # select
             cond, a, b = stack[sp], stack[sp-1], stack[sp-2]
             sp -= 2
-            if cond.val:
+            if cond[1]:  # I32
                 stack[sp] = b
             else:
                 stack[sp] = a
@@ -840,7 +786,7 @@ def interpret_v12(module,
             sp -= 1
 #            trace("cond: %s, depth: 0x%x" % (
 #                value_repr(cond), relative_depth))
-            if cond.val:
+            if cond[1]:  # I32
                 pc, sp, fp, bsp = do_branch(stack, blockstack, sp, fp,
                         bsp, relative_depth)
         elif 0x08 == opcode:  # br_table
@@ -852,8 +798,8 @@ def interpret_v12(module,
             pc, depth = read_LEB(code, pc, 32) # default
             expr = stack[sp]
             sp -= 1
-            assert isinstance(expr, I32)
-            didx = int(expr.val)
+            assert expr[0] == 0x01  # I32
+            didx = expr[1]  # I32
             if didx >= 0 and didx < len(depths):
                 depth = depths[didx]
 #            trace("depths: %s, index: %d, choosen depth: 0x%x" % (
@@ -906,24 +852,24 @@ def interpret_v12(module,
         elif 0x10 == opcode:  # i32.const
             pc, val = read_LEB(code, pc, 32, signed=True)
             sp += 1
-            stack[sp] = I32(int(val))
+            stack[sp] = (0x01, val, 0.0)
 #            trace("%s" % value_repr(stack[sp]))
         elif 0x11 == opcode:  # i64.const
             pc, val = read_LEB(code, pc, 64, signed=True)
             sp += 1
-            stack[sp] = I64(val)
+            stack[sp] = (0x02, val, 0.0)
 #            trace("%s" % value_repr(stack[sp]))
         elif 0x12 == opcode:  # f64.const
             bytes = code[pc:pc+8]
             pc += 8
             sp += 1
-            stack[sp] = F64(read_F64(bytes))
+            stack[sp] = (0x04, 0, read_F64(bytes))
 #            trace("%s" % value_repr(stack[sp]))
         elif 0x13 == opcode:  # f32.const
             bytes = code[pc:pc+4]
             pc += 4
             sp += 1
-            stack[sp] = F32(read_F32(bytes))
+            stack[sp] = (0x03, 0, read_F32(bytes))
 #            trace("%s" % value_repr(stack[sp]))
         elif 0x14 == opcode:  # get_local
             pc, arg = read_LEB(code, pc, 32)
@@ -953,7 +899,7 @@ def interpret_v12(module,
                 t = func.type
 #                trace("calling import %s.%s(%s)" % (
 #                    func.module, func.field,
-#                    ",".join([a.TYPE_NAME for a in t.params])))
+#                    ",".join([VALUE_TYPE[a] for a in t.params])))
                 sp = do_call_import(stack, sp, memory,
                         module.host_import_func, func)
             elif isinstance(func, Function):
@@ -965,8 +911,8 @@ def interpret_v12(module,
             pc, tidx = read_LEB(code, pc, 32)
             table_index_val = stack[sp]
             sp -= 1
-            assert isinstance(table_index_val, I32)
-            table_index = int(table_index_val.val)
+            assert table_index_val[0] == 0x01  # I32
+            table_index = int(table_index_val[1])  # I32
             promote(table_index)
             fidx = get_from_table(table, 0x20, table_index) # TODO: fix 0x20 for MVP
 #            trace("table idx: 0x%x, tidx: 0x%x, calling function fidx: 0x%x" % (
@@ -982,12 +928,12 @@ def interpret_v12(module,
         # Other Memory
         elif 0x3b == opcode:  # current_memory
             sp += 1
-            stack[sp] = I32(int(module.memory.pages))
+            stack[sp] = (0x01, module.memory.pages, 0.0)
         elif 0x39 == opcode:  # grow_memory
             prev_size = module.memory.pages
-            delta = stack[sp]
-            module.memory.grow(delta.val)
-            stack[sp] = I32(int(prev_size))
+            delta = stack[sp][1]  # I32
+            module.memory.grow(delta)
+            stack[sp] = (0x01, prev_size, 0.0)
 
         # Simple operations
 
@@ -995,16 +941,16 @@ def interpret_v12(module,
         elif opcode in [0x57, 0x58, 0x59, 0x5a]:
             a = stack[sp]
             sp -= 1
-            assert isinstance(a, I32)
+            assert a[0] == 0x01  # I32
             if   0x58 == opcode: # i32.ctz
                 count = 0
-                val = int(a.val)
+                val = a[1]
                 while (val % 2) == 0:
                     count += 1
                     val = val / 2
-                res = I32(count)
+                res = (0x01, count, 0.0)
             elif 0x5a == opcode: # i32.eqz
-                res = I32(a.val == 0)
+                res = (0x01, a[1] == 0, 0.0)
             else:
                 raise Exception("%s unimplemented"
                         % OPERATOR_INFO[opcode][0])
@@ -1017,27 +963,27 @@ def interpret_v12(module,
         elif 0x40 <= opcode <= 0x5a or opcode in [0xb6, 0xb7]:
             b, a = stack[sp], stack[sp-1]
             sp -= 2
-            assert isinstance(a, I32) and isinstance(b, I32)
+            assert a[0] == 0x01 and b[0] == 0x01  # I32 / I32
             if   0x40 == opcode: # i32.add
-                res = I32(int(a.val + b.val))
+                res = (0x01, a[1] + b[1], 0.0)
             elif 0x41 == opcode: # i32.sub
-                res = I32(int(a.val - b.val))
+                res = (0x01, a[1] - b[1], 0.0)
             elif 0x42 == opcode: # i32.mul
-                res = I32(int(a.val * b.val))
+                res = (0x01, a[1] * b[1], 0.0)
             elif 0x4d == opcode: # i32.eq
-                res = I32(int(a.val == b.val))
+                res = (0x01, a[1] == b[1], 0.0)
             elif 0x4e == opcode: # i32.ne
-                res = I32(int(a.val != b.val))
+                res = (0x01, a[1] != b[1], 0.0)
             elif 0x4f == opcode: # i32.lt_s
-                res = I32(int(a.val < b.val))
+                res = (0x01, a[1] < b[1], 0.0)
             elif 0x50 == opcode: # i32.le_s
-                res = I32(int(a.val <= b.val))
+                res = (0x01, a[1] <= b[1], 0.0)
             elif 0x51 == opcode: # i32.lt_u
-                res = I32(int(a.val < b.val))
+                res = (0x01, a[1] < b[1], 0.0)
             elif 0x52 == opcode: # i32.le_u
-                res = I32(int(a.val <= b.val))
+                res = (0x01, a[1] <= b[1], 0.0)
             elif 0x55 == opcode: # i32.gt_u
-                res = I32(int(a.val > b.val))
+                res = (0x01, a[1] > b[1], 0.0)
             else:
                 raise Exception("%s unimplemented"
                         % OPERATOR_INFO[opcode][0])
@@ -1051,9 +997,9 @@ def interpret_v12(module,
         elif opcode in [0x72, 0x73, 0x74, 0xba]:
             a = stack[sp]
             sp -= 1
-            assert isinstance(a, I64)
+            assert a[0] == 0x02  # I64
             if   0xba == opcode: # i64.eqz
-                res = I32(int(a.val == 0))
+                res = (0x01, a[1] == 0, 0.0)
             else:
                 raise Exception("%s unimplemented"
                         % OPERATOR_INFO[opcode][0])
@@ -1066,25 +1012,25 @@ def interpret_v12(module,
         elif 0x5b <= opcode <= 0x74 or opcode in [0xb8, 0xb9]:
             b, a = stack[sp], stack[sp-1]
             sp -= 2
-            assert isinstance(a, I64) and isinstance(b, I64)
+            assert a[0] == 0x02 and b[0] == 0x02  # I64 / I64
             if   0x5b == opcode: # i64.add
-                res = I64(int(a.val + b.val))
+                res = (0x02, a[1] + b[1], 0.0)
             elif 0x5c == opcode: # i64.sub
-                res = I64(int(a.val - b.val))
+                res = (0x02, a[1] - b[1], 0.0)
             elif 0x5d == opcode: # i64.mul
-                res = I64(int(a.val * b.val))
+                res = (0x02, sys.maxint & (a[1] * b[1]), 0.0)
             elif 0x5e == opcode: # i64.div_s
-                res = I64(int(a.val / b.val))
+                res = (0x02, a[1] / b[1], 0.0)
             elif 0x68 == opcode: # i64.eq
-                res = I32(int(a.val == b.val))
+                res = (0x01, a[1] == b[1], 0.0)
             elif 0x6a == opcode: # i64.lt_s
-                res = I32(int(a.val < b.val))
+                res = (0x01, a[1] < b[1], 0.0)
             elif 0x6d == opcode: # i64.le_s
-                res = I32(int(a.val <= b.val))
+                res = (0x01, a[1] <= b[1], 0.0)
             elif 0x6e == opcode: # i64.gt_s
-                res = I32(int(a.val > b.val))
+                res = (0x01, a[1] > b[1], 0.0)
             elif 0x70 == opcode: # i64.gt_u
-                res = I32(int(a.val > b.val))
+                res = (0x01, a[1] > b[1], 0.0)
             else:
                 raise Exception("%s unimplemented"
                         % OPERATOR_INFO[opcode][0])
@@ -1098,11 +1044,11 @@ def interpret_v12(module,
         elif opcode in [0x7b, 0x7c]:
             a = stack[sp]
             sp -= 1
-            assert isinstance(a, F32)
+            assert a[0] == 0x03  # F32
             if   0x7b == opcode: # f32.abs
-                res = F32(abs(a.val))
+                res = (0x03, 0, abs(a[2]))
             elif  0x7c == opcode: # f32.neg
-                res = F32(-a.val)
+                res = (0x03, 0, -a[2])
             else:
                 raise Exception("%s unimplemented"
                         % OPERATOR_INFO[opcode][0])
@@ -1115,21 +1061,21 @@ def interpret_v12(module,
         elif 0x75 <= opcode <= 0x88:
             b, a = stack[sp], stack[sp-1]
             sp -= 2
-            assert isinstance(a, F32) and isinstance(b, F32)
+            assert a[0] == 0x03 and b[0] == 0x03  # F32 / F32
             if   0x75 == opcode: # f32.add
-                res = F32(float(a.val + b.val))
+                res = (0x03, 0, a[2] + b[2])
             elif 0x76 == opcode: # f32.sub
-                res = F32(float(a.val - b.val))
+                res = (0x03, 0, a[2] - b[2])
             elif 0x77 == opcode: # f32.mul
-                res = F32(float(a.val * b.val))
+                res = (0x03, 0, a[2] * b[2])
             elif 0x78 == opcode: # f32.div
-                res = F32(float(a.val / b.val))
+                res = (0x03, 0, a[2] / b[2])
             elif 0x83 == opcode: # f32.eq
-                res = I32(int(a.val == b.val))
+                res = (0x01, a[2] == b[2], 0.0)
             elif 0x85 == opcode: # f32.lt
-                res = I32(int(a.val < b.val))
+                res = (0x01, a[2] < b[2], 0.0)
             elif 0x87 == opcode: # f32.gt
-                res = I32(int(a.val > b.val))
+                res = (0x01, a[2] > b[2], 0.0)
             else:
                 raise Exception("%s unimplemented"
                         % OPERATOR_INFO[opcode][0])
@@ -1143,11 +1089,11 @@ def interpret_v12(module,
         elif opcode in [0x8f, 0x90]:
             a = stack[sp]
             sp -= 1
-            assert isinstance(a, F64)
-            if   0x8f == opcode: # f32.abs
-                res = F64(abs(a.val))
-            elif  0x90 == opcode: # f32.neg
-                res = F64(-a.val)
+            assert a[0] == 0x04  # F64
+            if   0x8f == opcode: # f64.abs
+                res = (0x04, 0, abs(a[2]))
+            elif  0x90 == opcode: # f64.neg
+                res = (0x04, 0, -a[2])
             else:
                 raise Exception("%s unimplemented"
                         % OPERATOR_INFO[opcode][0])
@@ -1160,11 +1106,11 @@ def interpret_v12(module,
         elif 0x89 <= opcode <= 0x9c:
             b, a = stack[sp], stack[sp-1]
             sp -= 2
-            assert isinstance(a, F64) and isinstance(b, F64)
+            assert a[0] == 0x04 and b[0] == 0x04  # F64 / F64
             if   0x89 == opcode: # f64.add
-                res = F64(float(a.val + b.val))
+                res = (0x04, 0, a[2] + b[2])
             elif 0x8a == opcode: # f64.sub
-                res = F64(float(a.val - b.val))
+                res = (0x04, 0, a[2] - b[2])
             else:
                 raise Exception("%s unimplemented"
                         % OPERATOR_INFO[opcode][0])
@@ -1181,8 +1127,8 @@ def interpret_v12(module,
         elif 0xa1 == opcode: # i32.wrap/i64
             a = stack[sp]
             sp -= 1
-            assert isinstance(a, I64)
-            res = I32(int(a.val))
+            assert a[0] == 0x02  # I64
+            res = (0x01, a[1], 0.0)
 #            trace("(%s) = %s" % (
 #                value_repr(a), value_repr(res)))
             sp += 1
@@ -1190,8 +1136,8 @@ def interpret_v12(module,
         elif 0xa3 == opcode: # i64.trunc_s/f64
             a = stack[sp]
             sp -= 1
-            assert isinstance(a, F64)
-            res = I64(int(a.val))
+            assert a[0] == 0x04  # F64
+            res = (0x02, int(a[2]), 0.0)
 #            trace("(%s) = %s" % (
 #                value_repr(a), value_repr(res)))
             sp += 1
@@ -1199,8 +1145,8 @@ def interpret_v12(module,
         elif 0xa6 == opcode: # i64.extend_s/i32
             a = stack[sp]
             sp -= 1
-            assert isinstance(a, I32)
-            res = I64(int(a.val))
+            assert a[0] == 0x01  # I32
+            res = (0x02, a[1], 0.0)
 #            trace("(%s) = %s" % (
 #                value_repr(a), value_repr(res)))
             sp += 1
@@ -1208,8 +1154,8 @@ def interpret_v12(module,
         elif 0xa7 == opcode: # i64.extend_u/i32
             a = stack[sp]
             sp -= 1
-            assert isinstance(a, I32)
-            res = I64(int(a.val))
+            assert a[0] == 0x01  # I32
+            res = (0x02, a[1], 0.0)
 #            trace("(%s) = %s" % (
 #                value_repr(a), value_repr(res)))
             sp += 1
@@ -1217,8 +1163,8 @@ def interpret_v12(module,
         elif 0xae == opcode: # f64.convert_s/i32
             a = stack[sp]
             sp -= 1
-            assert isinstance(a, I32)
-            res = F64(float(a.val))
+            assert a[0] == 0x01  # I32
+            res = (0x04, 0, float(a[1]))
 #            trace("(%s) = %s" % (
 #                value_repr(a), value_repr(res)))
             sp += 1
@@ -1226,8 +1172,8 @@ def interpret_v12(module,
         elif 0xaf == opcode: # f64.convert_u/i32
             a = stack[sp]
             sp -= 1
-            assert isinstance(a, I32)
-            res = F64(float(a.val))
+            assert a[0] == 0x01  # I32
+            res = (0x04, 0, float(a[1]))
 #            trace("(%s) = %s" % (
 #                value_repr(a), value_repr(res)))
             sp += 1
@@ -1235,8 +1181,8 @@ def interpret_v12(module,
         elif 0xb0 == opcode: # f64.convert_s/i64
             a = stack[sp]
             sp -= 1
-            assert isinstance(a, I64)
-            res = F64(float(a.val))
+            assert a[0] == 0x02  # I64
+            res = (0x04, 0, float(a[1]))
 #            trace("(%s) = %s" % (
 #                value_repr(a), value_repr(res)))
             sp += 1
@@ -1244,8 +1190,8 @@ def interpret_v12(module,
         elif 0xb1 == opcode: # f64.convert_u/i64
             a = stack[sp]
             sp -= 1
-            assert isinstance(a, I64)
-            res = F64(float(a.val))
+            assert a[0] == 0x02  # I64
+            res = (0x04, 0, float(a[1]))
 #            trace("(%s) = %s" % (
 #                value_repr(a), value_repr(res)))
             sp += 1
@@ -1253,8 +1199,8 @@ def interpret_v12(module,
         elif 0xb2 == opcode: # f64.promote/f32
             a = stack[sp]
             sp -= 1
-            assert isinstance(a, F32)
-            res = F64(float(a.val))
+            assert a[0] == 0x03  # F32
+            res = (0x04, 0, a[2])
 #            trace("(%s) = %s" % (
 #                value_repr(a), value_repr(res)))
             sp += 1
@@ -1387,7 +1333,7 @@ class Module():
         # Execution state
         self.sp = -1
         self.fp = -1
-        self.stack = [NumericValueType()] * STACK_SIZE
+        self.stack = [(0x00, 0, 0.0)] * STACK_SIZE
         self.bsp = -1
         block = Block(0x00, BLOCK_TYPE[0x01], 0)
         self.blockstack = [(block, -1, -1, 0)] * BLOCKSTACK_SIZE
@@ -1400,9 +1346,9 @@ class Module():
         info("Types:")
         for i, t in enumerate(self.type):
             info("  0x%x [form: %s, params: %s, results: %s]" % (
-                i, t.form.TYPE_NAME,
-                [p.TYPE_NAME for p in t.params],
-                [r.TYPE_NAME for r in t.results]))
+                i, VALUE_TYPE[t.form],
+                [VALUE_TYPE[p] for p in t.params],
+                [VALUE_TYPE[r] for r in t.results]))
 
         info("Imports:")
         for i, imp in enumerate(self.import_list):
@@ -1428,7 +1374,7 @@ class Module():
                     i, f.type.index, f.module, f.field))
             else:
                 info("  0x%x [type: 0x%x, locals: %s, start: 0x%x, end: 0x%x]" % (
-                    i, f.type.index, [p.TYPE_NAME for p in f.locals],
+                    i, f.type.index, [VALUE_TYPE[p] for p in f.locals],
                     f.start, f.end))
 
         info("Tables:")
@@ -1490,15 +1436,15 @@ class Module():
     def parse_Type(self, length):
         count = self.rdr.read_LEB(32)
         for c in range(count):
-            form = VALUE_TYPE[self.rdr.read_LEB(7)]
+            form = self.rdr.read_LEB(7)
             params = []
             results = []
             param_count = self.rdr.read_LEB(32)
             for pc in range(param_count):
-                params.append(VALUE_TYPE[self.rdr.read_LEB(32)])
+                params.append(self.rdr.read_LEB(32))
             result_count = self.rdr.read_LEB(32)
             for rc in range(result_count):
-                results.append(VALUE_TYPE[self.rdr.read_LEB(32)])
+                results.append(self.rdr.read_LEB(32))
             tidx = len(self.type)
             self.type.append(Type(tidx, form, params, results))
 
@@ -1608,8 +1554,8 @@ class Module():
             self.interpret()  # run iter_expr
             offset_val = self.stack[self.sp]
             self.sp -= 1
-            assert isinstance(offset_val, I32)
-            offset = int(offset_val.val)
+            assert offset_val[0] == 0x01  # I32
+            offset = int(offset_val[1])
 
             num_elem = self.rdr.read_LEB(32)
             table = self.table[0x20]  # TODO: fix for MVP
@@ -1630,7 +1576,7 @@ class Module():
             count = self.rdr.read_LEB(32)
             type = self.rdr.read_LEB(7)
             for c in range(count):
-                locals.append(VALUE_TYPE[type])
+                locals.append(type)
         # TODO: simplify this calculation and find_blocks
         start = self.rdr.pos
         self.rdr.read_bytes(body_size - (self.rdr.pos-payload_start)-1)
@@ -1677,14 +1623,13 @@ class Module():
         for idx, arg in enumerate(args):
             arg = args[idx]
             assert isinstance(arg, str)
-            #tname = tparams[len(tparams)-idx-1].TYPE_NAME
-            tname = tparams[idx].TYPE_NAME
+            tname = VALUE_TYPE[tparams[idx]]
 #            print("run arg idx: %d, str: %s, tname: %s" % (idx, arg,
 #                tname))
-            if   tname == "i32": val = I32(int(arg))
-            elif tname == "i64": val = I64(int(arg))
-            elif tname == "f32": val = F32(float(arg))
-            elif tname == "f64": val = F64(float(arg))
+            if   tname == "i32": val = (0x01, int(arg), 0.0)
+            elif tname == "i64": val = (0x02, int(arg), 0.0)
+            elif tname == "f32": val = (0x03, 0, float(arg))
+            elif tname == "f64": val = (0x04, 0, float(arg))
             else: raise Exception("invalid argument %d: %s" % (
                 idx, arg))
             self.sp += 1
@@ -1705,18 +1650,13 @@ class Module():
             self.sp -= 1
             return ret
         else:
-            return None
+            return (0x00, 0, 0.0)
 
 
 ######################################
 # Imported functions points
 ######################################
 
-
-def DEBUG1(num0):
-    print("DEBUG: %s" % num0)
-def DEBUG2(num0, num1):
-    print("DEBUG: %s %s" % (num0, num1))
 
 def writeline(s):
     print(s)
@@ -1736,17 +1676,17 @@ def readline(prompt):
 # Current hard-coded for each function
 def call_import(mem, module, field, args):
     fname = "%s.%s" % (module, field)
-    host_args = [a.val for a in args]
     result = []
     if   fname == "core.DEBUG":
-        if len(host_args) == 1:
-            DEBUG1(host_args[0])
-        elif len(host_args) == 2:
-            DEBUG2(host_args[0], host_args[1])
+        if len(args) == 1:
+            print("DEBUG: %s" % (value_repr(args[0])))
+        elif len(args) == 2:
+            print("DEBUG: %s %s" % (
+                value_repr(args[0]), value_repr(args[1])))
         else:
             raise Exception("DEBUG called with > 2 args")
     elif fname == "core.writeline":
-        addr = int(host_args[0])
+        addr = args[0][1]  # I32
         assert addr >= 0
         debug("writeline addr: %s" % addr)
 
@@ -1756,8 +1696,8 @@ def call_import(mem, module, field, args):
         str = "".join([chr(b) for b in bytes])
         writeline(str)
     elif fname == "core.readline":
-        addr = int(host_args[0])
-        max_length = int(host_args[1])
+        addr = args[0][1]  # I32
+        max_length = args[1][1]  # I32
         assert addr >= 0
         assert max_length >= 0
         debug("readline addr: %s, max_length: %s" % (addr,
@@ -1779,9 +1719,9 @@ def call_import(mem, module, field, args):
                 pos += 1
             mem.write_I32(addr, length)
 
-            result.append(I32(int(length)))
+            result.append((0x01, int(length), 0.0))
         except EOFError:
-            result.append(I32(int(-1)))
+            result.append((0x01, int(-1), 0.0))
     else:
         raise Exception("invalid import %s.%s" % (module, field))
     return result
@@ -1815,7 +1755,7 @@ def entry_point(argv):
 
         # Args are strings at this point
         res = m.run(entry, args)
-        if res:
+        if res[0] != 0x00:
             info("%s(%s) = %s" % (
                 entry, ",".join(args), value_repr(res)))
             print(value_repr(res))
