@@ -29,6 +29,16 @@ def read_forms(string):
                 pos = end
                 continue
 
+            # TODO: handle nested multi-line comments
+            if string[pos:pos+2] == "(;":
+                # Skip multi-line comment
+                end = string.find(";)", pos)
+                if end == -1:
+                    raise Exception("mismatch multiline comment on line %d: '%s'" % (
+                        line, string[pos:pos+80]))
+                pos = end+2
+                continue
+
             # Ignore whitespace between top-level forms
             if string[pos] in (' ', '\n', '\t'):
                 pos += 1
@@ -72,12 +82,10 @@ def parse_val(val):
     else:
         raise Exception("invalid value '%s'" % val)
 
-def test_assert(mode, wasm, func, args, expected, returncode=0):
+
+def invoke(wasm, func, args, returncode=0):
     # convert back to strings for the call
     test_args = [str(a) for a in args]
-
-    print("Testing(%s) %s(%s) = %s" % (
-        mode, func, ", ".join(test_args), expected))
 
     # Convert args back to string
     cmd = [WARPY, wasm, func] + test_args 
@@ -88,8 +96,18 @@ def test_assert(mode, wasm, func, args, expected, returncode=0):
     if sp.returncode != returncode:
         raise Exception("Failed (retcode expected: %d, got: %d)\n%s" % (
             returncode, sp.returncode, err))
+    return out, err
 
+def test_assert(mode, wasm, func, args, expected, returncode=0):
+    print("Testing(%s) %s(%s) = %s" % (
+        mode, func, ", ".join([str(a) for a in args]), expected))
+
+    out, err = invoke(wasm, func, args, returncode)
+
+    # munge the output some
     out = out.rstrip("\n")
+    out = re.sub("L:i64$", ':i64', out)
+
     #print("  out: '%s'" % out)
     #print("  err: %s" % err)
     if (expected.find("unreachable") > -1
@@ -142,6 +160,25 @@ def test_assert_trap(wasm, form):
 
     test_assert("trap", wasm, func, args, expected, returncode=1)
 
+def do_invoke(wasm, form):
+    # params
+    m = re.search('^\(invoke\s+"([^"]+)"\s+(\(.*\))\s*\)\s*$', form)
+    if not m:
+        # no params
+        m = re.search('^\(invoke\s+"([^"]+)"\s*()\)\s*$', form)
+    if not m:
+        raise Exception("unparsed invoke: '%s'" % form)
+    func = m.group(1)
+    if m.group(2) == '':
+        args = []
+    else:
+        args = [parse_val(v)[0] for v in re.split("\)\s*\(", m.group(2)[1:-1])]
+
+    print("Invoking %s(%s)" % (
+        func, ", ".join([str(a) for a in args])))
+
+    invoke(wasm, func, args)
+
 def run_test_file(test_file):
     print("WAST2WASM: '%s'" % WAST2WASM)
     (t1fd, wast_tempfile) = tempfile.mkstemp(suffix=".wast")
@@ -171,14 +208,19 @@ def run_test_file(test_file):
             elif re.match("^\(assert_trap\\b.*", form):
                 #print("%s" % form)
                 test_assert_trap(wasm_tempfile, form)
+            elif re.match("^\(invoke\\b.*", form):
+                do_invoke(wasm_tempfile, form)
             elif re.match("^\(assert_invalid\\b.*", form):
                 #print("ignoring assert_invalid")
                 pass
             elif re.match("^\(assert_exhaustion\\b.*", form):
                 print("ignoring assert_exhaustion")
                 pass
+            elif re.match("^\(assert_unlinkable\\b.*", form):
+                print("ignoring assert_unlinkable")
+                pass
             else:
-                raise Exception("unrecognized form '%s...'" % form[0:20])
+                raise Exception("unrecognized form '%s...'" % form[0:40])
     finally:
         if CLEANUP:
             print("Removing tempfiles")
