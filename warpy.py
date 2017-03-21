@@ -8,7 +8,7 @@ if IS_RPYTHON:
     from rpython.jit.codewriter.policy import JitPolicy
     def jitpolicy(driver):
         return JitPolicy()
-    from rpython.rlib.jit import JitDriver, purefunction, unroll_safe
+    from rpython.rlib.jit import JitDriver, elidable, unroll_safe, promote
 
     from rpython.rtyper.lltypesystem import lltype
     from rpython.rtyper.lltypesystem.lloperation import llop
@@ -25,14 +25,14 @@ if IS_RPYTHON:
     def do_sort(a):
         IntSort(a).sort()
 
-    @purefunction
+    @elidable
     def unpack_f32(i32):
         return float_unpack(i32, 4)
-    @purefunction
+    @elidable
     def unpack_f64(i64):
         return float_unpack(i64, 8)
 
-    @purefunction
+    @elidable
     def fround(val, digits):
         return round_double(val, digits)
 
@@ -41,8 +41,9 @@ else:
     import traceback
     import struct
 
-    def purefunction(f): return f
+    def elidable(f): return f
     def unroll_safe(f): return f
+    def promote(x): pass
 
     def do_sort(a):
         a.sort()
@@ -58,8 +59,8 @@ else:
 INFO  = True   # informational logging
 DEBUG = False  # verbose logging
 #DEBUG = True   # verbose logging
-TRACE = False  # trace instruction codes
-#TRACE = True   # trace instruction codes
+TRACE = False  # trace instructions/stacks
+#TRACE = True   # trace instructions/stacks
 
 
 ######################################
@@ -429,18 +430,18 @@ def trace(str, end='\n'):
         os.write(2, str + end)
         #if end == '': sys.stderr.flush()
 
-@purefunction
+@elidable
 def bytes2uint32(b):
     return ((b[3]<<24) + (b[2]<<16) + (b[1]<<8) + b[0])
 
-@purefunction
+@elidable
 def bytes2uint64(b):
     return ((b[7]<<56) + (b[6]<<48) + (b[5]<<40) + (b[4]<<32) +
             (b[3]<<24) + (b[2]<<16) + (b[1]<<8) + b[0])
 
 
 # https://en.wikipedia.org/wiki/LEB128
-@purefunction
+@elidable
 def read_LEB(bytes, pos, maxbits=32, signed=False):
     result = 0
     shift = 0
@@ -464,12 +465,12 @@ def read_LEB(bytes, pos, maxbits=32, signed=False):
         result |= - (1 << shift)
     return (pos, result)
 
-@purefunction
+@elidable
 def read_F32(bytes):
     bits = bytes2uint32(bytes)
     return fround(unpack_f32(bits), 5)
 
-@purefunction
+@elidable
 def read_F64(bytes):
     bits = bytes2uint64(bytes)
     return unpack_f64(bits)
@@ -637,9 +638,11 @@ def pop_sig(sp, stack, lsp, localstack, bsp, blockstack):
         # Restore value stack to original size prior to call/block
         if orig_sp < sp:
             sp = orig_sp
+        pass
 
     return block, ra, sp, lsp, bsp
 
+@unroll_safe
 def do_branch(sp, stack, lsp, localstack, bsp, blockstack, depth):
     assert bsp+1 > depth
     target_block, _, _ = blockstack[bsp-depth]
@@ -657,6 +660,7 @@ def do_branch(sp, stack, lsp, localstack, bsp, blockstack, depth):
         return target_block.end, sp, lsp, bsp
         #raise Exception("br* from function unimplemented")
 
+@unroll_safe
 def do_call_import(sp, stack, memory, host_import_func, func):
     t = func.type
 
@@ -690,6 +694,7 @@ def do_call_import(sp, stack, memory, host_import_func, func):
             raise Exception("return signature mismatch")
     return sp
 
+@unroll_safe
 def do_call(sp, stack, lsp, localstack, bsp, blockstack, func, pc):
 
     # Push block, stack size and return address onto blockstack
@@ -736,18 +741,20 @@ def get_location_str(opcode, pc, code, function, table, block_map):
     return "0x%x %s(0x%x)" % (
             pc, OPERATOR_INFO[opcode][0], opcode)
 
-@purefunction
+@elidable
 def get_block(block_map, pc):
     return block_map[pc]
 
-@purefunction
+@elidable
 def get_function(function, fidx):
     return function[fidx]
 
-@purefunction
-def get_table(table, tidx):
-    return table[tidx]
-
+@elidable
+def get_from_table(table, tidx, table_index):
+    tbl = table[tidx]
+    if table_index < 0 or table_index >= len(tbl):
+        raise WAException("undefined element")
+    return tbl[table_index]
 
 if IS_RPYTHON:
     # greens/reds must be sorted: ints, refs, floats
@@ -972,12 +979,11 @@ def interpret_v12(host_import_func,
             sp -= 1
             assert isinstance(table_index_val, I32)
             table_index = int(table_index_val.val)
-            tbl = get_table(table, 0x20) # TODO: fix 0x20 for MVP
-            if table_index < 0 or table_index >= len(tbl):
-                raise WAException("undefined element")
-            fidx = tbl[table_index]
+            promote(table_index)
+            fidx = get_from_table(table, 0x20, table_index) # TODO: fix 0x20 for MVP
 #            trace("table idx: 0x%x, tidx: 0x%x, calling function fidx: 0x%x" % (
 #                table_index, tidx, fidx))
+            promote(fidx)
             pc, sp, lsp, bsp = do_call(sp, stack, lsp, localstack,
                     bsp, blockstack, get_function(function, fidx), pc)
 

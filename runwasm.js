@@ -106,7 +106,10 @@ if (module.parent) {
     assert(exports, 'no exports found')
     assert(func in exports, func + ' not found in wasm module exports')
     console.log('calling exports.'+func+'('+args+')')
-    let res = exports[func](...args)
+    let start = new Date(),
+        res = exports[func](...args),
+        end = new Date()
+    console.log('runtime: ' + (end-start) + 'ms')
     if (res) {
         console.log('0x' + res.toString(16))
     }
