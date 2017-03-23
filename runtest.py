@@ -111,10 +111,12 @@ def test_assert(mode, wasm, func, args, expected, returncode=0):
     #print("  out: '%s'" % out)
     #print("  err: %s" % err)
     if (expected.find("unreachable") > -1
-            and out.find("unreachable") > -1):
+            and err.find("unreachable") > -1):
         pass
     elif (expected.find("call signature mismatch") > -1
-            and out.find("call signature mismatch") > -1):
+            and err.find("call signature mismatch") > -1):
+        pass
+    elif err.find(expected) > -1:
         pass
     elif expected != out:
         raise Exception("Failed:\n  expected: '%s'\n  got: '%s'" % (
@@ -198,7 +200,8 @@ def run_test_file(test_file):
                 print("Compiling WASM to '%s'" % wasm_tempfile)
                 subprocess.check_call([
                     WAST2WASM,
-                    "--no-check-assert-invalid-and-malformed",
+                    #"--no-check-assert-invalid-and-malformed",
+                    "--no-check",
                     wast_tempfile,
                     "-o",
                     wasm_tempfile])

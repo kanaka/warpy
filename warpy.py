@@ -13,7 +13,7 @@ if IS_RPYTHON:
     from rpython.rtyper.lltypesystem import lltype
     from rpython.rtyper.lltypesystem.lloperation import llop
     from rpython.rlib.listsort import TimSort
-    from rpython.rlib.rstruct.ieee import float_unpack
+    from rpython.rlib.rstruct.ieee import float_unpack, float_pack
     from rpython.rlib.rfloat import round_double
 
     class IntSort(TimSort):
@@ -31,6 +31,13 @@ if IS_RPYTHON:
     @elidable
     def unpack_f64(i64):
         return float_unpack(i64, 8)
+    @elidable
+    def pack_f32(f32):
+        return float_pack(f32, 4)
+    @elidable
+    def pack_f64(f64):
+        return float_pack(f64, 8)
+
 
     @elidable
     def fround(val, digits):
@@ -52,15 +59,20 @@ else:
         return struct.unpack('f', struct.pack('I', i32))[0]
     def unpack_f64(i64):
         return struct.unpack('d', struct.pack('q', i64))[0]
+    def pack_f32(f32):
+        return struct.unpack('I', struct.pack('f', f32))[0]
+    def pack_f64(f64):
+        return struct.unpack('q', struct.pack('d', f64))[0]
 
     def fround(val, digits):
         return round(val, digits)
 
 INFO  = True   # informational logging
-DEBUG = False  # verbose logging
-#DEBUG = True   # verbose logging
+#DEBUG = False  # verbose logging
+DEBUG = True   # verbose logging
 TRACE = False  # trace instructions/stacks
 #TRACE = True   # trace instructions/stacks
+VALIDATE= True
 
 
 ######################################
@@ -70,6 +82,9 @@ TRACE = False  # trace instructions/stacks
 class WAException(Exception):
     def __init__(self, message):
         self.message = message
+
+# float('nan') does not work in rpython
+NAN = abs((1e200 * 1e200) / (1e200 * 1e200))
 
 class Type():
     def __init__(self, index, form, params, results):
@@ -123,32 +138,40 @@ class FunctionImport(Code):
 ######################################
 
 MAGIC = 0x6d736100
-VERSION = 0xc
+VERSION = 0x01  # MVP
 
 STACK_SIZE      = 65536
 BLOCKSTACK_SIZE = 8192
 
-VALUE_TYPE = { 0x01 : 'i32',
-               0x02 : 'i64',
-               0x03 : 'f32',
-               0x04 : 'f64',
-               0x10 : 'AnyFunc',
-               0x20 : 'Func',
-               0x40 : 'EmptyBlockType' }
+I32     = 0x7f  # -0x01
+I64     = 0x7e  # -0x02
+F32     = 0x7d  # -0x03
+F64     = 0x7c  # -0x04
+ANYFUNC = 0x70  # -0x10
+FUNC    = 0x60  # -0x20
+BLOCK   = 0x40  # -0x40
+
+VALUE_TYPE = { I32     : 'i32',
+               I64     : 'i64',
+               F32     : 'f32',
+               F64     : 'f64',
+               ANYFUNC : 'anyfunc',
+               FUNC    : 'func',
+               BLOCK   : 'block_type' }
 
 # Block signatures for blocks, loops, ifs
-BLOCK_TYPE = { 0x00 : Type(-1, -1, [], []),
-               0x01 : Type(-1, -1, [], [0x01]),
-               0x02 : Type(-1, -1, [], [0x02]),
-               0x03 : Type(-1, -1, [], [0x03]),
-               0x04 : Type(-1, -1, [], [0x04]) }
+BLOCK_TYPE = { I32   : Type(-1, BLOCK, [], [I32]),
+               I64   : Type(-1, BLOCK, [], [I64]),
+               F32   : Type(-1, BLOCK, [], [F32]),
+               F64   : Type(-1, BLOCK, [], [F64]),
+               BLOCK : Type(-1, BLOCK, [], []) }
 
 
-BLOCK_NAMES = { 0x00 : "fn",
-                0x01 : "block",
-                0x02 : "loop",
-                0x03 : "if",
-                0x04 : "else" }
+BLOCK_NAMES = { 0x00 : "fn",  # TODO: something else?
+                0x02 : "block",
+                0x03 : "loop",
+                0x04 : "if",
+                0x05 : "else" }
 
 
 EXTERNAL_KIND_NAMES = { 0x0 : "Function",
@@ -173,202 +196,229 @@ SECTION_NAMES = { 0  : 'Custom',
 #      opcode  name              immediate(s)
 OPERATOR_INFO = {
         # Control flow operators
-        0x00: ['unreachable',    ''],
-        0x01: ['block',          'inline_signature_type'],
-        0x02: ['loop',           'inline_signature_type'],
-        0x03: ['if',             'inline_signature_type'],
-        0x04: ['else',           ''],
-        0x05: ['select',         ''],
-        0x06: ['br',             'varuint32'],
-        0x07: ['br_if',          'varuint32'],
-        0x08: ['br_table',       'br_table'],
-        0x09: ['return',         ''],
-        0x0a: ['nop',            ''],
-        0x0b: ['drop',           ''],
-        0x0c: ['UNKNOWN',        ''],
-        0x0d: ['UNKNOWN',        ''],
-        0x0e: ['UNKNOWN',        ''],
-        0x0f: ['end',            ''],
+        0x00 : ['unreachable',    ''],
+        0x01 : ['nop',            ''],
+        0x02 : ['block',          'block_type'],
+        0x03 : ['loop',           'block_type'],
+        0x04 : ['if',             'block_type'],
+        0x05 : ['else',           ''],
+        0x06 : ['RESERVED',       ''],
+        0x07 : ['RESERVED',       ''],
+        0x08 : ['RESERVED',       ''],
+        0x09 : ['RESERVED',       ''],
+        0x0a : ['RESERVED',       ''],
+        0x0b : ['end',            ''],
+        0x0c : ['br',             'varuint32'],
+        0x0d : ['br_if',          'varuint32'],
+        0x0e : ['br_table',       'br_table'],
+        0x0f : ['return',         ''],
 
-        # Basic operators
-        0x10: ['i32.const',      'varint32'],
-        0x11: ['i64.const',      'varint64'],
-        0x12: ['f64.const',      'uint64'],
-        0x13: ['f32.const',      'uint32'],
-        0x14: ['get_local',      'varuint32'],
-        0x15: ['set_local',      'varuint32'],
-        0x16: ['call',           'varuint32'],
-        0x17: ['call_indirect',  'varuint32'],
-        0x18: ['UNKNOWN',        ''],
-        0x19: ['tee_local',      'varuint32'],
-        0x1a: ['UNKNOWN',        ''],
-        0x1b: ['UNKNOWN',        ''],
-        0x1c: ['UNKNOWN',        ''],
-        0x1d: ['UNKNOWN',        ''],
-        0x1e: ['UNKNOWN',        ''],
-        0x1f: ['UNKNOWN',        ''],
+        # Call operators
+        0x10 : ['call',           'varuint32'],
+        0x11 : ['call_indirect',  'varuint32+varuint1'],
 
-        0xbb: ['get_global',     'varuint32'],
-        0xbc: ['set_global',     'varuint32'],
+        0x12 : ['RESERVED',       ''],
+        0x13 : ['RESERVED',       ''],
+        0x14 : ['RESERVED',       ''],
+        0x15 : ['RESERVED',       ''],
+        0x16 : ['RESERVED',       ''],
+        0x17 : ['RESERVED',       ''],
+        0x18 : ['RESERVED',       ''],
+        0x19 : ['RESERVED',       ''],
+
+        # Parametric operators
+        0x1a : ['drop',           ''],
+        0x1b : ['select',         ''],
+
+        0x1c : ['RESERVED',       ''],
+        0x1d : ['RESERVED',       ''],
+        0x1e : ['RESERVED',       ''],
+        0x1f : ['RESERVED',       ''],
+
+        # Variable access
+        0x20 : ['get_local',      'varuint32'],
+        0x21 : ['set_local',      'varuint32'],
+        0x22 : ['tee_local',      'varuint32'],
+        0x23 : ['get_global',     'varuint32'],
+        0x24 : ['set_global',     'varuint32'],
+
+        0x25 : ['RESERVED',       ''],
+        0x26 : ['RESERVED',       ''],
+        0x27 : ['RESERVED',       ''],
 
         # Memory-related operators
-        0x20: ['i32.load8_s',    'memory_immediate'],
-        0x21: ['i32.load8_u',    'memory_immediate'],
-        0x22: ['i32.load16_s',   'memory_immediate'],
-        0x23: ['i32.load16_u',   'memory_immediate'],
-        0x24: ['i64.load8_s',    'memory_immediate'],
-        0x25: ['i64.load8_u',    'memory_immediate'],
-        0x26: ['i64.load16_s',   'memory_immediate'],
-        0x27: ['i64.load16_u',   'memory_immediate'],
-        0x28: ['i64.load32_s',   'memory_immediate'],
-        0x29: ['i64.load32_u',   'memory_immediate'],
-        0x2a: ['i32.load',       'memory_immediate'],
-        0x2b: ['i64.load',       'memory_immediate'],
-        0x2c: ['f32.load',       'memory_immediate'],
-        0x2d: ['f64.load',       'memory_immediate'],
-        0x2e: ['i32.store8',     'memory_immediate'],
-        0x2f: ['i32.store16',    'memory_immediate'],
-        0x30: ['i64.store8',     'memory_immediate'],
-        0x31: ['i64.store16',    'memory_immediate'],
-        0x32: ['i64.store32',    'memory_immediate'],
-        0x33: ['i32.store',      'memory_immediate'],
-        0x34: ['i64.store',      'memory_immediate'],
-        0x35: ['f32.store',      'memory_immediate'],
-        0x36: ['f64.store',      'memory_immediate'],
-        #0x37
-        #0x38
-        0x39: ['grow_memory',    ''],
-        #0x3a
-        0x3b: ['current_memory', ''],
+        0x28 : ['i32.load',       'memory_immediate'],
+        0x29 : ['i64.load',       'memory_immediate'],
+        0x2a : ['f32.load',       'memory_immediate'],
+        0x2b : ['f64.load',       'memory_immediate'],
+        0x2c : ['i32.load8_s',    'memory_immediate'],
+        0x2d : ['i32.load8_u',    'memory_immediate'],
+        0x2e : ['i32.load16_s',   'memory_immediate'],
+        0x2f : ['i32.load16_u',   'memory_immediate'],
+        0x30 : ['i64.load8_s',    'memory_immediate'],
+        0x31 : ['i64.load8_u',    'memory_immediate'],
+        0x32 : ['i64.load16_s',   'memory_immediate'],
+        0x33 : ['i64.load16_u',   'memory_immediate'],
+        0x34 : ['i64.load32_s',   'memory_immediate'],
+        0x35 : ['i64.load32_u',   'memory_immediate'],
+        0x36 : ['i32.store',      'memory_immediate'],
+        0x37 : ['i64.store',      'memory_immediate'],
+        0x38 : ['f32.store',      'memory_immediate'],
+        0x39 : ['f64.store',      'memory_immediate'],
+        0x3a : ['i32.store8',     'memory_immediate'],
+        0x3b : ['i32.store16',    'memory_immediate'],
+        0x3c : ['i64.store8',     'memory_immediate'],
+        0x3d : ['i64.store16',    'memory_immediate'],
+        0x3e : ['i64.store32',    'memory_immediate'],
+        0x3f : ['current_memory', 'varuint1'],
+        0x40 : ['grow_memory',    'varuint1'],
 
-        # Simple operators
-        0x40: ['i32.add',        ''],
-        0x41: ['i32.sub',        ''],
-        0x42: ['i32.mul',        ''],
-        0x43: ['i32.div_s',      ''],
-        0x44: ['i32.div_u',      ''],
-        0x45: ['i32.rem_s',      ''],
-        0x46: ['i32.rem_u',      ''],
-        0x47: ['i32.and',        ''],
-        0x48: ['i32.or',         ''],
-        0x49: ['i32.xor',        ''],
-        0x4a: ['i32.shl',        ''],
-        0x4b: ['i32.shr_u',      ''],
-        0x4c: ['i32.shr_s',      ''],
-        0x4d: ['i32.eq',         ''],
-        0x4e: ['i32.ne',         ''],
-        0x4f: ['i32.lt_s',       ''],
-        0x50: ['i32.le_s',       ''],
-        0x51: ['i32.lt_u',       ''],
-        0x52: ['i32.le_u',       ''],
-        0x53: ['i32.gt_s',       ''],
-        0x54: ['i32.ge_s',       ''],
-        0x55: ['i32.gt_u',       ''],
-        0x56: ['i32.ge_u',       ''],
-        0x57: ['i32.clz',        ''],
-        0x58: ['i32.ctz',        ''],
-        0x59: ['i32.popcnt',     ''],
-        0x5a: ['i32.eqz',        ''],
-        0x5b: ['i64.add',        ''],
-        0x5c: ['i64.sub',        ''],
-        0x5d: ['i64.mul',        ''],
-        0x5e: ['i64.div_s',      ''],
-        0x5f: ['i64.div_u',      ''],
-        0x60: ['i64.rem_s',      ''],
-        0x61: ['i64.rem_u',      ''],
-        0x62: ['i64.and',        ''],
-        0x63: ['i64.or',         ''],
-        0x64: ['i64.xor',        ''],
-        0x65: ['i64.shl',        ''],
-        0x66: ['i64.shr_u',      ''],
-        0x67: ['i64.shr_s',      ''],
-        0x68: ['i64.eq',         ''],
-        0x69: ['i64.ne',         ''],
-        0x6a: ['i64.lt_s',       ''],
-        0x6b: ['i64.le_s',       ''],
-        0x6c: ['i64.lt_u',       ''],
-        0x6d: ['i64.le_u',       ''],
-        0x6e: ['i64.gt_s',       ''],
-        0x6f: ['i64.ge_s',       ''],
-        0x70: ['i64.gt_u',       ''],
-        0x71: ['i64.ge_u',       ''],
-        0x72: ['i64.clz',        ''],
-        0x73: ['i64.ctz',        ''],
-        0x74: ['i64.popcnt',     ''],
-        0x75: ['f32.add',        ''],
-        0x76: ['f32.sub',        ''],
-        0x77: ['f32.mul',        ''],
-        0x78: ['f32.div',        ''],
-        0x79: ['f32.min',        ''],
-        0x7a: ['f32.max',        ''],
-        0x7b: ['f32.abs',        ''],
-        0x7c: ['f32.neg',        ''],
-        0x7d: ['f32.copysign',   ''],
-        0x7e: ['f32.ceil',       ''],
-        0x7f: ['f32.floor',      ''],
-        0x80: ['f32.trunc',      ''],
-        0x81: ['f32.nearest',    ''],
-        0x82: ['f32.sqrt',       ''],
-        0x83: ['f32.eq',         ''],
-        0x84: ['f32.ne',         ''],
-        0x85: ['f32.lt',         ''],
-        0x86: ['f32.le',         ''],
-        0x87: ['f32.gt',         ''],
-        0x88: ['f32.ge',         ''],
-        0x89: ['f64.add',        ''],
-        0x8a: ['f64.sub',        ''],
-        0x8b: ['f64.mul',        ''],
-        0x8c: ['f64.div',        ''],
-        0x8d: ['f64.min',        ''],
-        0x8e: ['f64.max',        ''],
-        0x8f: ['f64.abs',        ''],
-        0x90: ['f64.neg',        ''],
-        0x91: ['f64.copysign',   ''],
-        0x92: ['f64.ceil',       ''],
-        0x93: ['f64.floor',      ''],
-        0x94: ['f64.trunc',      ''],
-        0x95: ['f64.nearest',    ''],
-        0x96: ['f64.sqrt',       ''],
-        0x97: ['f64.eq',         ''],
-        0x98: ['f64.ne',         ''],
-        0x99: ['f64.lt',         ''],
-        0x9a: ['f64.le',         ''],
-        0x9b: ['f64.gt',         ''],
-        0x9c: ['f64.ge',         ''],
+        # Constants
+        0x41 : ['i32.const',      'varint32'],
+        0x42 : ['i64.const',      'varint64'],
+        0x43 : ['f32.const',      'uint32'],
+        0x44 : ['f64.const',      'uint64'],
 
-        # Conversion operators
-        0x9d: ['i32.trunc_s/f32',     ''],
-        0x9e: ['i32.trunc_s/f64',     ''],
-        0x9f: ['i32.trunc_u/f32',     ''],
-        0xa0: ['i32.trunc_u/f64',     ''],
-        0xa1: ['i32.wrap/i64',        ''],
-        0xa2: ['i64.trunc_s/f32',     ''],
-        0xa3: ['i64.trunc_s/f64',     ''],
-        0xa4: ['i64.trunc_u/f32',     ''],
-        0xa5: ['i64.trunc_u/f64',     ''],
-        0xa6: ['i64.extend_s/i32',    ''],
-        0xa7: ['i64.extend_u/i32',    ''],
-        0xa8: ['f32.convert_s/i32',   ''],
-        0xa9: ['f32.convert_u/i32',   ''],
-        0xaa: ['f32.convert_s/i64',   ''],
-        0xab: ['f32.convert_u/i64',   ''],
-        0xac: ['f32.demote/f64',      ''],
-        0xad: ['f32.reinterpret/i32', ''],
-        0xae: ['f64.convert_s/i32',   ''],
-        0xaf: ['f64.convert_u/i32',   ''],
-        0xb0: ['f64.convert_s/i64',   ''],
-        0xb1: ['f64.convert_u/i64',   ''],
-        0xb2: ['f64.promote/f32',     ''],
-        0xb3: ['f64.reinterpret/i64', ''],
-        0xb4: ['i32.reinterpret/f32', ''],
-        0xb5: ['i64.reinterpret/f64', ''],
+        # Comparison operators
+        0x45 : ['i32.eqz',        ''],
+        0x46 : ['i32.eq',         ''],
+        0x47 : ['i32.ne',         ''],
+        0x48 : ['i32.lt_s',       ''],
+        0x49 : ['i32.lt_u',       ''],
+        0x4a : ['i32.gt_s',       ''],
+        0x4b : ['i32.gt_u',       ''],
+        0x4c : ['i32.le_s',       ''],
+        0x4d : ['i32.le_u',       ''],
+        0x4e : ['i32.ge_s',       ''],
+        0x4f : ['i32.ge_u',       ''],
 
-        0xb6: ['i32.rotr',       ''],
-        0xb7: ['i32.rotl',       ''],
-        0xb8: ['i64.rotr',       ''],
-        0xb9: ['i64.rotl',       ''],
-        0xba: ['i64.eqz',        ''],
-           }
+        0x50 : ['i64.eqz',        ''],
+        0x51 : ['i64.eq',         ''],
+        0x52 : ['i64.ne',         ''],
+        0x53 : ['i64.lt_s',       ''],
+        0x54 : ['i64.lt_u',       ''],
+        0x55 : ['i64.gt_s',       ''],
+        0x56 : ['i64.gt_u',       ''],
+        0x57 : ['i64.le_s',       ''],
+        0x58 : ['i64.le_u',       ''],
+        0x59 : ['i64.ge_s',       ''],
+        0x5a : ['i64.ge_u',       ''],
+
+        0x5b : ['f32.eq',         ''],
+        0x5c : ['f32.ne',         ''],
+        0x5d : ['f32.lt',         ''],
+        0x5e : ['f32.gt',         ''],
+        0x5f : ['f32.le',         ''],
+        0x60 : ['f32.ge',         ''],
+
+        0x61 : ['f64.eq',         ''],
+        0x62 : ['f64.ne',         ''],
+        0x63 : ['f64.lt',         ''],
+        0x64 : ['f64.gt',         ''],
+        0x65 : ['f64.le',         ''],
+        0x66 : ['f64.ge',         ''],
+
+        # Numeric operators
+        0x67 : ['i32.clz',        ''],
+        0x68 : ['i32.ctz',        ''],
+        0x69 : ['i32.popcnt',     ''],
+        0x6a : ['i32.add',        ''],
+        0x6b : ['i32.sub',        ''],
+        0x6c : ['i32.mul',        ''],
+        0x6d : ['i32.div_s',      ''],
+        0x6e : ['i32.div_u',      ''],
+        0x6f : ['i32.rem_s',      ''],
+        0x70 : ['i32.rem_u',      ''],
+        0x71 : ['i32.and',        ''],
+        0x72 : ['i32.or',         ''],
+        0x73 : ['i32.xor',        ''],
+        0x74 : ['i32.shl',        ''],
+        0x75 : ['i32.shr_u',      ''],
+        0x76 : ['i32.shr_s',      ''],
+        0x77 : ['i32.rotl',       ''],
+        0x78 : ['i32.rotr',       ''],
+
+        0x79 : ['i64.clz',        ''],
+        0x7a : ['i64.ctz',        ''],
+        0x7b : ['i64.popcnt',     ''],
+        0x7c : ['i64.add',        ''],
+        0x7d : ['i64.sub',        ''],
+        0x7e : ['i64.mul',        ''],
+        0x7f : ['i64.div_s',      ''],
+        0x80 : ['i64.div_u',      ''],
+        0x81 : ['i64.rem_s',      ''],
+        0x82 : ['i64.rem_u',      ''],
+        0x83 : ['i64.and',        ''],
+        0x84 : ['i64.or',         ''],
+        0x85 : ['i64.xor',        ''],
+        0x86 : ['i64.shl',        ''],
+        0x87 : ['i64.shr_s',      ''],
+        0x88 : ['i64.shr_u',      ''],
+        0x89 : ['i64.rotl',       ''],
+        0x8a : ['i64.rotr',       ''],
+
+        0x8b : ['f32.abs',        ''],
+        0x8c : ['f32.neg',        ''],
+        0x8d : ['f32.ceil',       ''],
+        0x8e : ['f32.floor',      ''],
+        0x8f : ['f32.trunc',      ''],
+        0x90 : ['f32.nearest',    ''],
+        0x91 : ['f32.sqrt',       ''],
+        0x92 : ['f32.add',        ''],
+        0x93 : ['f32.sub',        ''],
+        0x94 : ['f32.mul',        ''],
+        0x95 : ['f32.div',        ''],
+        0x96 : ['f32.min',        ''],
+        0x97 : ['f32.max',        ''],
+        0x98 : ['f32.copysign',   ''],
+
+        0x99 : ['f64.abs',        ''],
+        0x9a : ['f64.neg',        ''],
+        0x9b : ['f64.ceil',       ''],
+        0x9c : ['f64.floor',      ''],
+        0x9d : ['f64.trunc',      ''],
+        0x9e : ['f64.nearest',    ''],
+        0x9f : ['f64.sqrt',       ''],
+        0xa0 : ['f64.add',        ''],
+        0xa1 : ['f64.sub',        ''],
+        0xa2 : ['f64.mul',        ''],
+        0xa3 : ['f64.div',        ''],
+        0xa4 : ['f64.min',        ''],
+        0xa5 : ['f64.max',        ''],
+        0xa6 : ['f64.copysign',   ''],
+
+        # Conversions
+        0xa7 : ['i32.wrap/i64',        ''],
+        0xa8 : ['i32.trunc_s/f32',     ''],
+        0xa9 : ['i32.trunc_u/f32',     ''],
+        0xaa : ['i32.trunc_s/f64',     ''],
+        0xab : ['i32.trunc_u/f64',     ''],
+
+        0xac : ['i64.extend_s/i32',    ''],
+        0xad : ['i64.extend_u/i32',    ''],
+        0xae : ['i64.trunc_s/f32',     ''],
+        0xaf : ['i64.trunc_u/f32',     ''],
+        0xb0 : ['i64.trunc_s/f64',     ''],
+        0xb1 : ['i64.trunc_u/f64',     ''],
+
+        0xb2 : ['f32.convert_s/i32',   ''],
+        0xb3 : ['f32.convert_u/i32',   ''],
+        0xb4 : ['f32.convert_s/i64',   ''],
+        0xb5 : ['f32.convert_u/i64',   ''],
+        0xb6 : ['f32.demote/f64',      ''],
+
+        0xb7 : ['f64.convert_s/i32',   ''],
+        0xb8 : ['f64.convert_u/i32',   ''],
+        0xb9 : ['f64.convert_s/i64',   ''],
+        0xba : ['f64.convert_u/i64',   ''],
+        0xbb : ['f64.promote/f32',     ''],
+
+        # Reinterpretations
+        0xbc : ['i32.reinterpret/f32', ''],
+        0xbd : ['i64.reinterpret/f64', ''],
+        0xbe : ['f32.reinterpret/i32', ''],
+        0xbf : ['f64.reinterpret/i64', ''],
+        }
 
 
 ######################################
@@ -385,20 +435,70 @@ def debug(str, end='\n'):
         os.write(2, str + end)
         #if end == '': sys.stderr.flush()
 
-def trace(str, end='\n'):
-    if TRACE:
-        os.write(2, str + end)
-        #if end == '': sys.stderr.flush()
+@elidable
+def bytes2uint8(b):
+    return b[0]
+
+@elidable
+def bytes2int8(b):
+    val = b[0]
+    if val & 0x80:
+        return val - 0x100
+    else:
+        return val
+
+#
+
+@elidable
+def bytes2uint16(b):
+    return (b[1]<<8) + b[0]
+
+@elidable
+def bytes2int16(b):
+    val = (b[1]<<8) + b[0]
+    if val & 0x8000:
+        return val - 0x10000
+    else:
+        return val
+
+#
 
 @elidable
 def bytes2uint32(b):
-    return ((b[3]<<24) + (b[2]<<16) + (b[1]<<8) + b[0])
+    return (b[3]<<24) + (b[2]<<16) + (b[1]<<8) + b[0]
+
+@elidable
+def uint322bytes(v):
+    return ( v & 0xff,
+            (v & 0xff00)>>8,
+            (v & 0xff0000)>>16,
+            (v & 0xff000000)>>24)
+
+@elidable
+def bytes2int32(b):
+    val = (b[3]<<24) + (b[2]<<16) + (b[1]<<8) + b[0]
+    if val & 0x80000000:
+        return val - 0x100000000
+    else:
+        return val
+
+#
 
 @elidable
 def bytes2uint64(b):
     return ((b[7]<<56) + (b[6]<<48) + (b[5]<<40) + (b[4]<<32) +
             (b[3]<<24) + (b[2]<<16) + (b[1]<<8) + b[0])
 
+@elidable
+def uint642bytes(v):
+    return ( v & 0xff,
+            (v & 0xff00)>>8,
+            (v & 0xff0000)>>16,
+            (v & 0xff000000)>>24,
+            (v & 0xff00000000)>>32,
+            (v & 0xff0000000000)>>40,
+            (v & 0xff000000000000)>>48,
+            (v & 0xff00000000000000)>>56)
 
 # https://en.wikipedia.org/wiki/LEB128
 @elidable
@@ -426,14 +526,37 @@ def read_LEB(bytes, pos, maxbits=32, signed=False):
     return (pos, result)
 
 @elidable
-def read_F32(bytes):
-    bits = bytes2uint32(bytes)
+def read_I32(bytes, pos):
+    return bytes2uint32(bytes[pos:pos+4])
+
+@elidable
+def read_I64(bytes, pos):
+    return bytes2uint32(bytes[pos:pos+8])
+
+@elidable
+def read_F32(bytes, pos):
+    bits = bytes2uint32(bytes[pos:pos+4])
     return fround(unpack_f32(bits), 5)
 
 @elidable
-def read_F64(bytes):
-    bits = bytes2uint64(bytes)
-    return unpack_f64(bits)
+def read_F64(bytes, pos):
+    bits = bytes2uint64(bytes[pos:pos+8])
+    return unpack_f64(sys.maxint & bits)
+
+def write_I32(bytes, pos, ival):
+    bytes[pos:pos+4] = uint322bytes(ival)
+
+def write_I64(bytes, pos, ival):
+    bytes[pos:pos+8] = uint642bytes(ival)
+
+def write_F32(bytes, pos, fval):
+    ival = pack_f32(fval)
+    bytes[pos:pos+4] = uint322bytes(ival)
+
+def write_F64(bytes, pos, fval):
+    ival = pack_f64(fval)
+    bytes[pos:pos+8] = uint642bytes(ival)
+
 
 def value_repr(val):
     vt, ival, fval = val
@@ -445,15 +568,33 @@ def value_repr(val):
     else:
         raise Exception("unknown value type %s" % vtn)
 
-def sig_repr(sig):
-    if isinstance(sig, Block):
+def type_repr(t):
+    return "<form: %s, params: %s, results: %s>" % (
+        VALUE_TYPE[t.form], [VALUE_TYPE[p] for p in t.params],
+        [VALUE_TYPE[r] for r in t.results])
+
+def export_repr(e):
+    return "<kind: %s, field: %s, index: 0x%x>" % (
+            EXTERNAL_KIND_NAMES[e.kind], e.field, e.index)
+
+def func_repr(f):
+    if isinstance(f, FunctionImport):
+        return "<type: 0x%x, import: '%s.%s'>" % (
+                f.type.index, f.module, f.field)
+    else:
+        return "<type: 0x%x, locals: %s, start: 0x%x, end: 0x%x>" % (
+                f.type.index, [VALUE_TYPE[p] for p in f.locals],
+                f.start, f.end)
+
+def block_repr(block):
+    if isinstance(block, Block):
         return "%s<0->%d>" % (
-                BLOCK_NAMES[sig.kind],
-                len(sig.type.results))
-    elif isinstance(sig, Function):
+                BLOCK_NAMES[block.kind],
+                len(block.type.results))
+    elif isinstance(block, Function):
         return "fn%d<%d/%d->%d>" % (
-                sig.index, len(sig.type.params),
-                len(sig.locals), len(sig.type.results))
+                block.index, len(block.type.params),
+                len(block.locals), len(block.type.results))
 
 def stack_repr(sp, fp, stack):
     res = []
@@ -465,15 +606,14 @@ def stack_repr(sp, fp, stack):
 
 def blockstack_repr(bsp, bs):
     return "[" + " ".join(["%s(sp:0x%x/fp:0x%x/ra:0x%x)" % (
-        sig_repr(bs[i][0]),bs[i][1],bs[i][2],bs[i][3])
+        block_repr(bs[i][0]),bs[i][1],bs[i][2],bs[i][3])
                            for i in range(bsp+1)]) + "]"
 
 def dump_stacks(sp, stack, fp, bsp, blockstack):
-    if INFO:
-        trace("      * stack:       %s" % (
-            stack_repr(sp, fp, stack)))
-        trace("      * blockstack:  %s" % (
-            blockstack_repr(bsp, blockstack)))
+    debug("      * stack:       %s" % (
+        stack_repr(sp, fp, stack)))
+    debug("      * blockstack:  %s" % (
+        blockstack_repr(bsp, blockstack)))
 
 def byte_code_repr(bytes):
     res = []
@@ -487,37 +627,57 @@ def byte_code_repr(bytes):
 def skip_immediates(code, pos):
     opcode = code[pos]
     pos += 1
+    vals = []
     imtype = OPERATOR_INFO[opcode][1]
-    if   'varint32' == imtype:
-        pos, _ = read_LEB(code, pos, 32)
+    if   'varuint1' == imtype:
+        pos, v = read_LEB(code, pos, 1)
+        vals.append(v)
+    elif 'varint32' == imtype:
+        pos, v = read_LEB(code, pos, 32)
+        vals.append(v)
     elif 'varuint32' == imtype:
-        pos, _ = read_LEB(code, pos, 32)
+        pos, v = read_LEB(code, pos, 32)
+        vals.append(v)
+    elif 'varuint32+varuint1' == imtype:
+        pos, v = read_LEB(code, pos, 32)
+        vals.append(v)
+        pos, v = read_LEB(code, pos, 1)
+        vals.append(v)
     elif 'varint64' == imtype:
-        pos, _ = read_LEB(code, pos, 64)
+        pos, v = read_LEB(code, pos, 64)
+        vals.append(v)
     elif 'varuint64' == imtype:
-        pos, _ = read_LEB(code, pos, 64)
+        pos, v = read_LEB(code, pos, 64)
+        vals.append(v)
     elif 'uint32' == imtype:
+        vals.append(read_F32(code, pos))
         pos += 4
     elif 'uint64' == imtype:
+        vals.append(read_F64(code, pos))
         pos += 8
-    elif 'inline_signature_type' == imtype:
-        pos += 1  # 1 byte signature
+    elif 'block_type' == imtype:
+        pos, v = read_LEB(code, pos, 7)  # block signature
+        vals.append(v)
     elif 'memory_immediate' == imtype:
-        pos, _ = read_LEB(code, pos, 32)  # flags
-        pos, _ = read_LEB(code, pos, 32)  # offset
+        pos, v = read_LEB(code, pos, 32)  # flags
+        vals.append(v)
+        pos, v = read_LEB(code, pos, 32)  # offset
+        vals.append(v)
     elif 'br_table' == imtype:
         pos, count = read_LEB(code, pos, 32)  # target count
+        vals.append(count)
         for i in range(count):
-            pos, _ = read_LEB(code, pos, 32)  # target
-        pos, _ = read_LEB(code, pos, 32)  # default target
+            pos, v = read_LEB(code, pos, 32)  # target
+            vals.append(v)
+        pos, v = read_LEB(code, pos, 32)  # default target
+        vals.append(v)
     elif '' == imtype:
         pass # no immediates
     else:
         raise Exception("unknown immediate type %s" % imtype)
-    return pos
+    return pos, vals
 
 def find_blocks(code, start, end, block_map):
-    debug("find_blocks start: 0x%x, end: 0x%x" % (start, end))
     pos = start
 
     # map of blocks: {start : (type, end), ...}
@@ -534,25 +694,25 @@ def find_blocks(code, start, end, block_map):
         #debug("0x%x: %s, opstack: %s" % (
         #    pos, OPERATOR_INFO[opcode][0],
         #    ["%d,%s,0x%x" % (o,s.index,p) for o,s,p in opstack]))
-        if   0x01 <= opcode <= 0x03:  # block, loop, if
+        if   0x02 <= opcode <= 0x04:  # block, loop, if
             block_sig = BLOCK_TYPE[code[pos+1]]
             block = Block(opcode, block_sig, pos)
             opstack.append(block)
             block_map[pos] = block
-        elif 0x04 == opcode:  # mark else positions
-            assert opstack[-1].kind == 0x03, "else not matched with if"
+        elif 0x05 == opcode:  # mark else positions
+            assert opstack[-1].kind == 0x04, "else not matched with if"
             opstack[-1].else_addr = pos+1
-        elif 0x0f == opcode:  # end
+        elif 0x0b == opcode:  # end
             if pos == end: break
             block = opstack.pop()
-            if block.kind == 0x02:  # loop: label after start
+            if block.kind == 0x03:  # loop: label after start
                 block.update(pos, block.start+2)
             else:  # block/if: label at end
                 block.update(pos, pos)
             block_end_map[pos] = True
-        pos = skip_immediates(code, pos)
+        pos, _ = skip_immediates(code, pos)
 
-    assert opcode == 0xf, "function block did not end with 0xf"
+    assert opcode == 0xb, "function block did not end with 0xf"
 
     #debug("block_map: %s" % block_map)
     #debug("block_end_map: %s" % block_end_map)
@@ -560,16 +720,17 @@ def find_blocks(code, start, end, block_map):
     return block_map
 
 @unroll_safe
-def pop_sig(stack, blockstack, sp, fp, bsp):
+def pop_block(stack, blockstack, sp, fp, bsp):
     block, orig_sp, orig_fp, ra = blockstack[bsp]
     bsp -= 1
     t = block.type
 
     # Validate return value if there is one
-    if len(t.results) > 1:
-        raise Exception("multiple return values unimplemented")
-    if len(t.results) > sp+1:
-        raise Exception("stack underflow")
+    if VALIDATE:
+        if len(t.results) > 1:
+            raise Exception("multiple return values unimplemented")
+        if len(t.results) > sp+1:
+            raise Exception("stack underflow")
 
     if len(t.results) == 1:
         # Restore main value stack, saving top return value
@@ -595,10 +756,10 @@ def pop_sig(stack, blockstack, sp, fp, bsp):
 
 @unroll_safe
 def do_branch(stack, blockstack, sp, fp, bsp, depth):
-    assert bsp+1 > depth
+    if VALIDATE: assert bsp+1 > depth
     target_block, _, fp, _ = blockstack[bsp-depth]
     for r in range(depth):
-        block, _, sp, fp, bsp = pop_sig(stack, blockstack,
+        block, _, sp, fp, bsp = pop_block(stack, blockstack,
                 sp, fp, bsp)
     return target_block.br_addr, sp, fp, bsp
 
@@ -607,7 +768,7 @@ def do_call(stack, blockstack, sp, fp, bsp, func, pc):
 
     # Push block, stack size and return address onto blockstack
     t = func.type
-    assert bsp < BLOCKSTACK_SIZE, "call stack exhausted"
+    if VALIDATE: assert bsp < BLOCKSTACK_SIZE, "call stack exhausted"
     bsp += 1
     blockstack[bsp] = (func, sp-len(t.params), fp, pc)
 
@@ -622,11 +783,12 @@ def do_call(stack, blockstack, sp, fp, bsp, func, pc):
     # push locals (dropping extras)
     fp = sp - len(t.params) + 1
     for tidx in range(len(t.params)):
-        ptype = t.params[tidx]
         val = stack[fp+tidx]
-        if ptype != val[0]:
-            raise WAException("call signature mismatch: %s != %s" % (
-                VALUE_TYPE[ptype], VALUE_TYPE[val[0]]))
+        if VALIDATE:
+            ptype = t.params[tidx]
+            if ptype != val[0]:
+                raise WAException("call signature mismatch: %s != %s" % (
+                    VALUE_TYPE[ptype], VALUE_TYPE[val[0]]))
 
     for lidx in range(len(func.locals)):
         ltype = func.locals[lidx]
@@ -643,13 +805,14 @@ def do_call_import(stack, sp, memory, host_import_func, func):
     # make sure args match signature
     args = []
     for idx in range(len(t.params)-1, -1, -1):
-        ptype = t.params[idx]
         arg = stack[sp]
         sp -= 1
-        if ptype != arg[0]:
-            raise WAException("call signature mismatch: %s != %s" % (
-                VALUE_TYPE[ptype], VALUE_TYPE[arg[0]]))
         args.append(arg)
+        if VALIDATE:
+            ptype = t.params[idx]
+            if ptype != arg[0]:
+                raise WAException("call signature mismatch: %s != %s" % (
+                    VALUE_TYPE[ptype], VALUE_TYPE[arg[0]]))
 
     # Workaround rpython failure to identify type
     results = [(0, 0, 0.0)]
@@ -700,8 +863,7 @@ if IS_RPYTHON:
                   'module', 'memory', 'stack', 'blockstack'],
             get_printable_location=get_location_str)
 
-# TODO: update for MVP
-def interpret_v12(module,
+def interpret_mvp(module,
         # Greens
         pc, code, function, table, block_map,
         # Reds
@@ -723,31 +885,37 @@ def interpret_v12(module,
                     module=module, memory=memory,
                     stack=stack, blockstack=blockstack)
 
-        if TRACE: dump_stacks(sp, stack, fp, bsp, blockstack)
         cur_pc = pc
         pc += 1
+
         if TRACE:
-            trace("    [0x%x %s (0x%x)] - " % (
-                cur_pc, OPERATOR_INFO[opcode][0], opcode))
-                #end='')
+            dump_stacks(sp, stack, fp, bsp, blockstack)
+            _, immediates = skip_immediates(code, cur_pc)
+            info("    0x%x <0x%x/%s%s%s>" % (
+                cur_pc, opcode, OPERATOR_INFO[opcode][0],
+                " " if immediates else "",
+                ",".join(["0x%x" % i for i in immediates])))
+
+        #
+        # Control flow operators
+        #
         if   0x00 == opcode:  # unreachable
-#            trace("unreachable")
             raise WAException("unreachable")
-        elif 0x01 == opcode:  # block
+        elif 0x01 == opcode:  # nop
+            pass
+        elif 0x02 == opcode:  # block
             pc, ignore = read_LEB(code, pc, 32) # ignore block_type
             block = get_block(block_map, cur_pc)
             bsp += 1
             blockstack[bsp] = (block, sp, fp, 0)
-#            trace("sig: %s at 0x%x" % (
-#                sig_repr(block), cur_pc))
-        elif 0x02 == opcode:  # loop
+            if TRACE: debug("      - block: %s" % block_repr(block))
+        elif 0x03 == opcode:  # loop
             pc, ignore = read_LEB(code, pc, 32) # ignore block_type
             block = get_block(block_map, cur_pc)
             bsp += 1
             blockstack[bsp] = (block, sp, fp, 0)
-#            trace("sig: %s at 0x%x" % (
-#                sig_repr(block), cur_pc))
-        elif 0x03 == opcode:  # if
+            if TRACE: debug("      - block: %s" % block_repr(block))
+        elif 0x04 == opcode:  # if
             pc, ignore = read_LEB(code, pc, 32) # ignore block_type
             block = get_block(block_map, cur_pc)
             bsp += 1
@@ -762,34 +930,49 @@ def interpret_v12(module,
                     pc = block.br_addr+1
                 else:
                     pc = block.else_addr
-#            trace("cond: %s jump to 0x%x, sig: %s at 0x%x" % (
-#                value_repr(cond), pc, sig_repr(block), cur_pc))
-        elif 0x04 == opcode:  # else
+            if TRACE:
+                debug("      - cond: %s jump to 0x%x, block: %s" % (
+                    value_repr(cond), pc, block_repr(block)))
+        elif 0x05 == opcode:  # else
             block = blockstack[bsp][0]
             pc = block.br_addr
-#            trace("of %s jump to 0x%x" % (sig_repr(block), pc))
-        elif 0x05 == opcode:  # select
-            cond, a, b = stack[sp], stack[sp-1], stack[sp-2]
-            sp -= 2
-            if cond[1]:  # I32
-                stack[sp] = b
+            if TRACE:
+                debug("      - of %s jump to 0x%x" % (
+                    block_repr(block), pc))
+        elif 0x0b == opcode:  # end
+            block, ra, sp, fp, bsp = pop_block(stack, blockstack, sp,
+                    fp, bsp)
+            if TRACE: debug("      - of %s" % block_repr(block))
+            if isinstance(block, Function):
+                # Return to return address
+                pc = ra
+                if bsp == -1:
+                    # Return to top-level, ignoring return_addr
+                    return pc, sp
+                else:
+                    if TRACE:
+                        info("  Returning from function 0x%x to 0x%x" % (
+                            block.index, pc))
+            elif isinstance(block, Block) and block.kind == 0x00:
+                # this is an init_expr
+                return pc, sp
             else:
-                stack[sp] = a
-        elif 0x06 == opcode:  # br
+                pass # end of block/loop/if, keep going
+        elif 0x0c == opcode:  # br
             pc, relative_depth = read_LEB(code, pc, 32)
             pc, sp, fp, bsp = do_branch(stack, blockstack, sp, fp,
                     bsp, relative_depth)
-#            trace("depth: 0x%x, to: 0x%x" % (relative_depth, pc))
-        elif 0x07 == opcode:  # br_if
+            if TRACE: debug("      - to: 0x%x" % pc)
+        elif 0x0d == opcode:  # br_if
             pc, relative_depth = read_LEB(code, pc, 32)
             cond = stack[sp]
             sp -= 1
-#            trace("cond: %s, depth: 0x%x" % (
-#                value_repr(cond), relative_depth))
             if cond[1]:  # I32
                 pc, sp, fp, bsp = do_branch(stack, blockstack, sp, fp,
                         bsp, relative_depth)
-        elif 0x08 == opcode:  # br_table
+            if TRACE:
+                debug("      - cond: %s, to: 0x%x" % (cond[1], pc))
+        elif 0x0e == opcode:  # br_table
             pc, target_count = read_LEB(code, pc, 32)
             depths = []
             for c in range(target_count):
@@ -798,15 +981,16 @@ def interpret_v12(module,
             pc, depth = read_LEB(code, pc, 32) # default
             expr = stack[sp]
             sp -= 1
-            assert expr[0] == 0x01  # I32
+            if VALIDATE: assert expr[0] == I32
             didx = expr[1]  # I32
             if didx >= 0 and didx < len(depths):
                 depth = depths[didx]
-#            trace("depths: %s, index: %d, choosen depth: 0x%x" % (
-#                depths, didx, depth))
             pc, sp, fp, bsp = do_branch(stack, blockstack, sp, fp,
                     bsp, depth)
-        elif 0x09 == opcode:  # return
+            if TRACE:
+                debug("      - depths: %s, didx: %d, to: 0x%x" % (
+                    depths, didx, pc))
+        elif 0x0f == opcode:  # return
             # Pop blocks until reach Function signature
             while bsp >= 0:
                 if isinstance(blockstack[bsp][0], Function): break
@@ -815,394 +999,499 @@ def interpret_v12(module,
                 # value properly.
                 block = blockstack[bsp]
                 bsp -= 1
-            assert bsp >= 0
+            if VALIDATE: assert bsp >= 0
             block = blockstack[bsp][0]
-            assert isinstance(block, Function)
+            if VALIDATE: assert isinstance(block, Function)
             # Set instruction pointer to end of function
             # The actual pop_sig and return is handled by handling
             # the end opcode
             pc = block.end
-#            trace("to 0x%x" % block.br_addr)
-        elif 0x0a == opcode:  # nop
-#            trace("")
-            pass
-        elif 0x0b == opcode:  # drop
-#            trace("%s" % value_repr(stack[sp]))
-            sp -= 1
-        elif 0x0f == opcode:  # end
-            block, ra, sp, fp, bsp = pop_sig(stack, blockstack, sp,
-                    fp, bsp)
-#            trace("of %s" % sig_repr(block))
-            if isinstance(block, Function):
-                # Return to return address
-                pc = ra
-                if bsp == -1:
-                    # Return to top-level, ignoring return_addr
-                    return pc, sp
-                else:
-                    if DEBUG:
-#                        trace("  Returning from function %d to %d" % (
-#                            block.index, return_addr))
-                        pass
-            elif isinstance(block, Block) and block.kind == 0x00:
-                # this is an init_expr
-                return pc, sp
-            else:
-                pass # end of block/loop/if, keep going
-        elif 0x10 == opcode:  # i32.const
-            pc, val = read_LEB(code, pc, 32, signed=True)
-            sp += 1
-            stack[sp] = (0x01, val, 0.0)
-#            trace("%s" % value_repr(stack[sp]))
-        elif 0x11 == opcode:  # i64.const
-            pc, val = read_LEB(code, pc, 64, signed=True)
-            sp += 1
-            stack[sp] = (0x02, val, 0.0)
-#            trace("%s" % value_repr(stack[sp]))
-        elif 0x12 == opcode:  # f64.const
-            bytes = code[pc:pc+8]
-            pc += 8
-            sp += 1
-            stack[sp] = (0x04, 0, read_F64(bytes))
-#            trace("%s" % value_repr(stack[sp]))
-        elif 0x13 == opcode:  # f32.const
-            bytes = code[pc:pc+4]
-            pc += 4
-            sp += 1
-            stack[sp] = (0x03, 0, read_F32(bytes))
-#            trace("%s" % value_repr(stack[sp]))
-        elif 0x14 == opcode:  # get_local
-            pc, arg = read_LEB(code, pc, 32)
-#            trace("0x%x" % arg)
-            sp += 1
-            stack[sp] = stack[fp+arg]
-        elif 0x15 == opcode:  # set_local
-            pc, arg = read_LEB(code, pc, 32)
-            val = stack[sp]
-            sp -= 1
-            stack[fp+arg] = val
-#            trace("0x%x to %s" % (arg, value_repr(val)))
-        elif 0x19 == opcode:  # tee_local
-            pc, arg = read_LEB(code, pc, 32)
-            val = stack[sp] # like set_local but do not pop
-            stack[fp+arg] = val
-#            trace("0x%x to %s" % (arg, value_repr(val)))
-        elif 0xbb == opcode:  # get_global
-            raise Exception("get_global unimplemented")
-        elif 0xbc == opcode:  # set_global
-            raise Exception("set_global unimplemented")
-        elif 0x16 == opcode:  # call
+            if TRACE: debug("      - to 0x%x" % block.br_addr)
+
+        #
+        # Call operators
+        #
+        elif 0x10 == opcode:  # call
             pc, fidx = read_LEB(code, pc, 32)
             func = get_function(function, fidx)
 
             if isinstance(func, FunctionImport):
                 t = func.type
-#                trace("calling import %s.%s(%s)" % (
-#                    func.module, func.field,
-#                    ",".join([VALUE_TYPE[a] for a in t.params])))
+                if TRACE:
+                    debug("      - calling import %s.%s(%s)" % (
+                        func.module, func.field,
+                        ",".join([VALUE_TYPE[a] for a in t.params])))
                 sp = do_call_import(stack, sp, memory,
                         module.host_import_func, func)
             elif isinstance(func, Function):
-#                trace("calling function fidx: %d" % fidx)
                 pc, sp, fp, bsp = do_call(stack, blockstack, sp, fp,
                         bsp, func, pc)
-        elif 0x17 == opcode:  # call_indirect
+                if TRACE: debug("      - calling function fidx: %d"
+                                " at: 0x%x" % (fidx, pc))
+        elif 0x11 == opcode:  # call_indirect
             # TODO: what do we do with tidx?
             pc, tidx = read_LEB(code, pc, 32)
-            table_index_val = stack[sp]
+            pc, reserved = read_LEB(code, pc, 1)
+            type_index_val = stack[sp]
             sp -= 1
-            assert table_index_val[0] == 0x01  # I32
-            table_index = int(table_index_val[1])  # I32
+            if VALIDATE: assert type_index_val[0] == I32
+            table_index = int(type_index_val[1])  # I32
             promote(table_index)
-            fidx = get_from_table(table, 0x20, table_index) # TODO: fix 0x20 for MVP
-#            trace("table idx: 0x%x, tidx: 0x%x, calling function fidx: 0x%x" % (
-#                table_index, tidx, fidx))
+            fidx = get_from_table(table, ANYFUNC, table_index)
             promote(fidx)
             pc, sp, fp, bsp = do_call(stack, blockstack, sp, fp, bsp,
                     get_function(function, fidx), pc)
+            if TRACE:
+                debug("      - table idx: 0x%x, tidx: 0x%x,"
+                      " calling function fidx: 0x%x at 0x%x" % (
+                          table_index, tidx, fidx, pc))
 
-        # Memory immediates
-        elif 0x20 <= opcode <= 0x36:
-            raise Exception("memory immediates unimplemented")
+        #
+        # Parametric operators
+        #
+        elif 0x1a == opcode:  # drop
+            if TRACE: debug("      - dropping: %s" % value_repr(stack[sp]))
+            sp -= 1
+        elif 0x1b == opcode:  # select
+            cond, a, b = stack[sp], stack[sp-1], stack[sp-2]
+            sp -= 2
+            if cond[1]:  # I32
+                stack[sp] = b
+            else:
+                stack[sp] = a
+            if TRACE:
+                debug("      - cond: 0x%x, selected: %s" % (
+                    cond[1], value_repr(stack[sp])))
 
-        # Other Memory
-        elif 0x3b == opcode:  # current_memory
+        #
+        # Variable access
+        #
+        elif 0x20 == opcode:  # get_local
+            pc, arg = read_LEB(code, pc, 32)
             sp += 1
-            stack[sp] = (0x01, module.memory.pages, 0.0)
-        elif 0x39 == opcode:  # grow_memory
+            stack[sp] = stack[fp+arg]
+            if TRACE: debug("      - got %s" % value_repr(stack[sp]))
+        elif 0x21 == opcode:  # set_local
+            pc, arg = read_LEB(code, pc, 32)
+            val = stack[sp]
+            sp -= 1
+            stack[fp+arg] = val
+            if TRACE: debug("      - to %s" % value_repr(val))
+        elif 0x22 == opcode:  # tee_local
+            pc, arg = read_LEB(code, pc, 32)
+            val = stack[sp] # like set_local but do not pop
+            stack[fp+arg] = val
+            if TRACE: debug("      - to %s" % value_repr(val))
+        elif 0x23 == opcode:  # get_global
+            raise Exception("get_global unimplemented")
+        elif 0x24 == opcode:  # set_global
+            raise Exception("set_global unimplemented")
+
+        #
+        # Memory-related operators
+        #
+
+        # Memory load operators
+        elif 0x28 <= opcode <= 0x35:
+            pc, flags = read_LEB(code, pc, 32)
+            pc, offset = read_LEB(code, pc, 32)
+            addr_val = stack[sp]
+            sp -= 1
+            if flags != 2:
+                if TRACE:
+                    info("      - unaligned load - flags: 0x%x,"
+                         " offset: 0x%x, addr: 0x%x" % (
+                             flags, offset, addr_val[1]))
+            addr = addr_val[1] + offset
+            try:
+                if   0x28 == opcode:  # i32.load
+                    res = (I32, read_I32(memory.bytes, addr), 0.0)
+                elif 0x29 == opcode:  # i64.load
+                    res = (I64, read_I64(memory.bytes, addr), 0.0)
+                elif 0x2a == opcode:  # f32.load
+                    res = (F32, 0, read_F32(memory.bytes, addr))
+                elif 0x2b == opcode:  # f64.load
+                    res = (F64, 0, read_F64(memory.bytes, addr))
+                elif 0x2c == opcode:  # i32.load8_s
+                    res = (I32, bytes2int8(memory.bytes[addr:addr+1]), 0.0)
+                elif 0x2d == opcode:  # i32.load8_u
+                    res = (I32, memory.bytes[addr], 0.0)
+                elif 0x2e == opcode:  # i32.load16_s
+                    res = (I32, bytes2int16(memory.bytes[addr:addr+2]), 0.0)
+                elif 0x2f == opcode:  # i32.load16_u
+                    res = (I32, bytes2uint16(memory.bytes[addr:addr+2]), 0.0)
+                elif 0x30 == opcode:  # i64.load8_s
+                    res = (I64, bytes2int8(memory.bytes[addr:addr+1]), 0.0)
+                elif 0x31 == opcode:  # i64.load8_u
+                    res = (I64, memory.bytes[addr], 0.0)
+                elif 0x32 == opcode:  # i64.load16_s
+                    res = (I64, bytes2int16(memory.bytes[addr:addr+2]), 0.0)
+                elif 0x33 == opcode:  # i64.load16_u
+                    res = (I64, bytes2uint16(memory.bytes[addr:addr+2]), 0.0)
+                elif 0x34 == opcode:  # i64.load32_s
+                    res = (I64, bytes2int32(memory.bytes[addr:addr+4]), 0.0)
+                elif 0x35 == opcode:  # i64.load32_u
+                    res = (I64, bytes2uint32(memory.bytes[addr:addr+4]), 0.0)
+            except IndexError:
+                raise WAException("out of bounds memory access")
+            sp += 1
+            stack[sp] = res
+
+        # Memory store operators
+        elif 0x36 <= opcode <= 0x3e:
+            pc, flags = read_LEB(code, pc, 32)
+            pc, offset = read_LEB(code, pc, 32)
+            val = stack[sp]
+            sp -= 1
+            addr_val = stack[sp]
+            sp -= 1
+            if flags != 2:
+                if TRACE:
+                    info("      - unaligned store - flags: 0x%x,"
+                         " offset: 0x%x, addr: 0x%x, val: 0x%x" % (
+                             flags, offset, addr_val[1], val[1]))
+            addr = addr_val[1] + offset
+            if   0x36 == opcode:  # i32.store
+                write_I32(memory.bytes, addr, val[1])
+            elif 0x37 == opcode:  # i64.store
+                write_I64(memory.bytes, addr, val[1])
+            elif 0x39 == opcode:  # f64.store
+                write_F64(memory.bytes, addr, val[2])
+            elif 0x3a == opcode:  # i32.store8
+                memory.bytes[addr] = val[1] & 0xff
+            elif 0x3b == opcode:  # i32.store16
+                memory.bytes[addr]   =  val[1] & 0x00ff
+                memory.bytes[addr+1] = (val[1] & 0xff00)>>8
+            elif 0x3c == opcode:  # i64.store8
+                memory.bytes[addr]   =  val[1] & 0xff
+            elif 0x3d == opcode:  # i64.store16
+                memory.bytes[addr]   =  val[1] & 0x00ff
+                memory.bytes[addr+1] = (val[1] & 0xff00)>>8
+            elif 0x3e == opcode:  # i64.store32
+                memory.bytes[addr]   =  val[1] & 0x000000ff
+                memory.bytes[addr+1] = (val[1] & 0x0000ff00)>>8
+                memory.bytes[addr+2] = (val[1] & 0x00ff0000)>>16
+                memory.bytes[addr+3] = (val[1] & 0xff000000)>>24
+            else:
+                raise Exception("%s(0x%x) unimplemented" % (
+                    OPERATOR_INFO[opcode][0], opcode))
+
+        # Memory size operators
+        elif 0x3f == opcode:  # current_memory
+            pc, reserved = read_LEB(code, pc, 1)
+            sp += 1
+            stack[sp] = (I32, module.memory.pages, 0.0)
+            if TRACE:
+                debug("      - current 0x%x" % module.memory.pages)
+        elif 0x40 == opcode:  # grow_memory
+            pc, reserved = read_LEB(code, pc, 1)
             prev_size = module.memory.pages
             delta = stack[sp][1]  # I32
             module.memory.grow(delta)
-            stack[sp] = (0x01, prev_size, 0.0)
+            stack[sp] = (I32, prev_size, 0.0)
+            debug("      - delta 0x%x, prev: 0x%x" % (
+                delta, prev_size))
 
-        # Simple operations
+        #
+        # Constants
+        #
+        elif 0x41 == opcode:  # i32.const
+            pc, val = read_LEB(code, pc, 32, signed=True)
+            sp += 1
+            stack[sp] = (I32, val, 0.0)
+            if TRACE: debug("      - %s" % value_repr(stack[sp]))
+        elif 0x42 == opcode:  # i64.const
+            pc, val = read_LEB(code, pc, 64, signed=True)
+            sp += 1
+            stack[sp] = (I64, val, 0.0)
+            if TRACE: debug("      - %s" % value_repr(stack[sp]))
+        elif 0x43 == opcode:  # f32.const
+            sp += 1
+            stack[sp] = (F32, 0, read_F32(code, pc))
+            pc += 4
+            if TRACE: debug("      - %s" % value_repr(stack[sp]))
+        elif 0x44 == opcode:  # f64.const
+            sp += 1
+            stack[sp] = (F64, 0, read_F64(code, pc))
+            pc += 8
+            if TRACE: debug("      - %s" % value_repr(stack[sp]))
 
-        # i32 unary operations
-        elif opcode in [0x57, 0x58, 0x59, 0x5a]:
+        # 
+        # Comparison operators
+        #
+
+        # unary
+        elif opcode in [0x45, 0x50]:
             a = stack[sp]
             sp -= 1
-            assert a[0] == 0x01  # I32
-            if   0x58 == opcode: # i32.ctz
+            if   0x45 == opcode: # i32.eqz
+                if VALIDATE: assert a[0] == I32
+                res = (I32, a[1] == 0, 0.0)
+            elif 0x50 == opcode: # i64.eqz
+                if VALIDATE: assert a[0] == I64
+                res = (I32, a[1] == 0, 0.0)
+            else:
+                raise Exception("%s(0x%x) unimplemented" % (
+                    OPERATOR_INFO[opcode][0], opcode))
+            if TRACE:
+                debug("      - (%s) = %s" % (
+                    value_repr(a), value_repr(res)))
+            sp += 1
+            stack[sp] = res
+
+        # binary
+        elif 0x46 <= opcode <= 0x66:
+            a, b = stack[sp-1], stack[sp]
+            sp -= 2
+            if   0x46 == opcode: # i32.eq
+                if VALIDATE: assert a[0] == I32 and b[0] == I32
+                res = (I32, a[1] == b[1], 0.0)
+            elif 0x47 == opcode: # i32.ne
+                if VALIDATE: assert a[0] == I32 and b[0] == I32
+                res = (I32, a[1] != b[1], 0.0)
+            elif 0x48 == opcode: # i32.lt_s
+                if VALIDATE: assert a[0] == I32 and b[0] == I32
+                res = (I32, a[1] < b[1], 0.0)
+            elif 0x49 == opcode: # i32.lt_u
+                if VALIDATE: assert a[0] == I32 and b[0] == I32
+                res = (I32, a[1] < b[1], 0.0)
+            elif 0x4b == opcode: # i32.gt_u
+                if VALIDATE: assert a[0] == I32 and b[0] == I32
+                res = (I32, a[1] > b[1], 0.0)
+            elif 0x4c == opcode: # i32.le_s
+                if VALIDATE: assert a[0] == I32 and b[0] == I32
+                res = (I32, a[1] <= b[1], 0.0)
+            elif 0x4d == opcode: # i32.le_u
+                if VALIDATE: assert a[0] == I32 and b[0] == I32
+                res = (I32, a[1] <= b[1], 0.0)
+            elif 0x51 == opcode: # i64.eq
+                if VALIDATE: assert a[0] == I64 and b[0] == I64
+                res = (I32, a[1] == b[1], 0.0)
+            elif 0x53 == opcode: # i64.lt_s
+                if VALIDATE: assert a[0] == I64 and b[0] == I64
+                res = (I32, a[1] < b[1], 0.0)
+            elif 0x55 == opcode: # i64.gt_s
+                if VALIDATE: assert a[0] == I64 and b[0] == I64
+                res = (I32, a[1] > b[1], 0.0)
+            elif 0x56 == opcode: # i64.gt_u
+                if VALIDATE: assert a[0] == I64 and b[0] == I64
+                res = (I32, a[1] > b[1], 0.0)
+            elif 0x57 == opcode: # i64.le_s
+                if VALIDATE: assert a[0] == I64 and b[0] == I64
+                res = (I32, a[1] <= b[1], 0.0)
+            elif 0x58 == opcode: # i64.le_u
+                if VALIDATE: assert a[0] == I64 and b[0] == I64
+                res = (I32, a[1] <= b[1], 0.0)
+            elif 0x5b == opcode: # f32.eq
+                if VALIDATE: assert a[0] == F32 and b[0] == F32
+                res = (I32, a[2] == b[2], 0.0)
+            elif 0x5d == opcode: # f32.lt
+                if VALIDATE: assert a[0] == F32 and b[0] == F32
+                res = (I32, a[2] < b[2], 0.0)
+            elif 0x5e == opcode: # f32.gt
+                if VALIDATE: assert a[0] == F32 and b[0] == F32
+                res = (I32, a[2] > b[2], 0.0)
+            elif 0x61 == opcode: # f64.eq
+                if VALIDATE: assert a[0] == F64 and b[0] == F64
+                res = (I32, a[2] == b[2], 0.0)
+            elif 0x62 == opcode: # f64.ne
+                if VALIDATE: assert a[0] == F64 and b[0] == F64
+                res = (I32, a[2] != b[2], 0.0)
+            else:
+                raise Exception("%s(0x%x) unimplemented" % (
+                    OPERATOR_INFO[opcode][0], opcode))
+            if TRACE:
+                debug("      - (%s, %s) = %s" % (
+                    value_repr(a), value_repr(b), value_repr(res)))
+            sp += 1
+            stack[sp] = res
+
+        # 
+        # Numeric operators
+        #
+
+        # unary
+        elif opcode in [0x67, 0x68, 0x69, 0x79, 0x7a, 0x7b, 0x8b,
+                        0x8c, 0x99, 0x9a]:
+            a = stack[sp]
+            sp -= 1
+            if 0x68 == opcode: # i32.ctz
+                if VALIDATE: assert a[0] == I32
                 count = 0
                 val = a[1]
                 while (val % 2) == 0:
                     count += 1
                     val = val / 2
-                res = (0x01, count, 0.0)
-            elif 0x5a == opcode: # i32.eqz
-                res = (0x01, a[1] == 0, 0.0)
-            else:
-                raise Exception("%s unimplemented"
-                        % OPERATOR_INFO[opcode][0])
-#            trace("(%s) = %s" % (
-#                value_repr(a), value_repr(res)))
-            sp += 1
-            stack[sp] = res
-
-        # i32 binary operations
-        elif 0x40 <= opcode <= 0x5a or opcode in [0xb6, 0xb7]:
-            b, a = stack[sp], stack[sp-1]
-            sp -= 2
-            assert a[0] == 0x01 and b[0] == 0x01  # I32 / I32
-            if   0x40 == opcode: # i32.add
-                res = (0x01, a[1] + b[1], 0.0)
-            elif 0x41 == opcode: # i32.sub
-                res = (0x01, a[1] - b[1], 0.0)
-            elif 0x42 == opcode: # i32.mul
-                res = (0x01, a[1] * b[1], 0.0)
-            elif 0x4d == opcode: # i32.eq
-                res = (0x01, a[1] == b[1], 0.0)
-            elif 0x4e == opcode: # i32.ne
-                res = (0x01, a[1] != b[1], 0.0)
-            elif 0x4f == opcode: # i32.lt_s
-                res = (0x01, a[1] < b[1], 0.0)
-            elif 0x50 == opcode: # i32.le_s
-                res = (0x01, a[1] <= b[1], 0.0)
-            elif 0x51 == opcode: # i32.lt_u
-                res = (0x01, a[1] < b[1], 0.0)
-            elif 0x52 == opcode: # i32.le_u
-                res = (0x01, a[1] <= b[1], 0.0)
-            elif 0x55 == opcode: # i32.gt_u
-                res = (0x01, a[1] > b[1], 0.0)
-            else:
-                raise Exception("%s unimplemented"
-                        % OPERATOR_INFO[opcode][0])
-
-#            trace("(%s, %s) = %s" % (
-#                value_repr(a), value_repr(b), value_repr(res)))
-            sp += 1
-            stack[sp] = res
-
-        # i64 unary operations
-        elif opcode in [0x72, 0x73, 0x74, 0xba]:
-            a = stack[sp]
-            sp -= 1
-            assert a[0] == 0x02  # I64
-            if   0xba == opcode: # i64.eqz
-                res = (0x01, a[1] == 0, 0.0)
-            else:
-                raise Exception("%s unimplemented"
-                        % OPERATOR_INFO[opcode][0])
-#            trace("(%s) = %s" % (
-#                value_repr(a), value_repr(res)))
-            sp += 1
-            stack[sp] = res
-
-        # i64 binary operations
-        elif 0x5b <= opcode <= 0x74 or opcode in [0xb8, 0xb9]:
-            b, a = stack[sp], stack[sp-1]
-            sp -= 2
-            assert a[0] == 0x02 and b[0] == 0x02  # I64 / I64
-            if   0x5b == opcode: # i64.add
-                res = (0x02, a[1] + b[1], 0.0)
-            elif 0x5c == opcode: # i64.sub
-                res = (0x02, a[1] - b[1], 0.0)
-            elif 0x5d == opcode: # i64.mul
-                res = (0x02, sys.maxint & (a[1] * b[1]), 0.0)
-            elif 0x5e == opcode: # i64.div_s
-                res = (0x02, a[1] / b[1], 0.0)
-            elif 0x68 == opcode: # i64.eq
-                res = (0x01, a[1] == b[1], 0.0)
-            elif 0x6a == opcode: # i64.lt_s
-                res = (0x01, a[1] < b[1], 0.0)
-            elif 0x6d == opcode: # i64.le_s
-                res = (0x01, a[1] <= b[1], 0.0)
-            elif 0x6e == opcode: # i64.gt_s
-                res = (0x01, a[1] > b[1], 0.0)
-            elif 0x70 == opcode: # i64.gt_u
-                res = (0x01, a[1] > b[1], 0.0)
-            else:
-                raise Exception("%s unimplemented"
-                        % OPERATOR_INFO[opcode][0])
-
-#            trace("(%s, %s) = %s" % (
-#                value_repr(a), value_repr(b), value_repr(res)))
-            sp += 1
-            stack[sp] = res
-
-        # f32 unary operations
-        elif opcode in [0x7b, 0x7c]:
-            a = stack[sp]
-            sp -= 1
-            assert a[0] == 0x03  # F32
-            if   0x7b == opcode: # f32.abs
-                res = (0x03, 0, abs(a[2]))
+                res = (I32, count, 0.0)
+            elif 0x7b == opcode: # f32.abs
+                if VALIDATE: assert a[0] == F32
+                res = (F32, 0, abs(a[2]))
             elif  0x7c == opcode: # f32.neg
-                res = (0x03, 0, -a[2])
+                if VALIDATE: assert a[0] == F32
+                res = (F32, 0, -a[2])
+            elif 0x8b == opcode: # f32.abs
+                if VALIDATE: assert a[0] == F32
+                res = (F64, 0, abs(a[2]))
+            elif  0x8c == opcode: # f32.neg
+                if VALIDATE: assert a[0] == F32
+                res = (F64, 0, -a[2])
+            elif 0x99 == opcode: # f64.abs
+                if VALIDATE: assert a[0] == F64
+                res = (F64, 0, abs(a[2]))
+            elif  0x9a == opcode: # f64.neg
+                if VALIDATE: assert a[0] == F64
+                res = (F64, 0, -a[2])
             else:
-                raise Exception("%s unimplemented"
-                        % OPERATOR_INFO[opcode][0])
-#            trace("(%s) = %s" % (
-#                value_repr(a), value_repr(res)))
+                raise Exception("%s(0x%x) unimplemented" % (
+                    OPERATOR_INFO[opcode][0], opcode))
+            if TRACE:
+                debug("      - (%s) = %s" % (
+                    value_repr(a), value_repr(res)))
+            sp += 1
+            stack[sp] = res
+
+        # i32 binary
+        elif 0x6a <= opcode <= 0x78:
+            b, a = stack[sp], stack[sp-1]
+            sp -= 2
+            if VALIDATE: assert a[0] == I32 and b[0] == I32
+            if   0x6a == opcode: # i32.add
+                res = (I32, a[1] + b[1], 0.0)
+            elif 0x6b == opcode: # i32.sub
+                res = (I32, a[1] - b[1], 0.0)
+            elif 0x6c == opcode: # i32.mul
+                res = (I32, a[1] * b[1], 0.0)
+            elif 0x71 == opcode: # i32.and
+                res = (I32, a[1] & b[1], 0.0)
+            else:
+                raise Exception("%s(0x%x) unimplemented" % (
+                    OPERATOR_INFO[opcode][0], opcode))
+            if TRACE:
+                debug("      - (%s, %s) = %s" % (
+                    value_repr(a), value_repr(b), value_repr(res)))
+            sp += 1
+            stack[sp] = res
+
+        # i64 binary
+        elif 0x7c <= opcode <= 0x8a:
+            a, b = stack[sp-1], stack[sp]
+            sp -= 2
+            debug("a[0]: %s, b[0]: %s" % (a[0], b[0]))
+            if VALIDATE: assert a[0] == I64 and b[0] == I64
+            if   0x7c == opcode: # i64.add
+                res = (I64, a[1] + b[1], 0.0)
+            elif 0x7d == opcode: # i64.sub
+                res = (I64, a[1] - b[1], 0.0)
+            elif 0x7e == opcode: # i64.mul
+                res = (I64, sys.maxint & (a[1] * b[1]), 0.0)
+            elif 0x7f == opcode: # i64.div_s
+                res = (I64, a[1] / b[1], 0.0)
+            else:
+                raise Exception("%s(0x%x) unimplemented" % (
+                    OPERATOR_INFO[opcode][0], opcode))
+            if TRACE:
+                debug("      - (%s, %s) = %s" % (
+                    value_repr(a), value_repr(b), value_repr(res)))
             sp += 1
             stack[sp] = res
 
         # f32 binary operations
-        elif 0x75 <= opcode <= 0x88:
+        elif 0x92 <= opcode <= 0x97:
             b, a = stack[sp], stack[sp-1]
             sp -= 2
-            assert a[0] == 0x03 and b[0] == 0x03  # F32 / F32
-            if   0x75 == opcode: # f32.add
-                res = (0x03, 0, a[2] + b[2])
-            elif 0x76 == opcode: # f32.sub
-                res = (0x03, 0, a[2] - b[2])
-            elif 0x77 == opcode: # f32.mul
-                res = (0x03, 0, a[2] * b[2])
-            elif 0x78 == opcode: # f32.div
-                res = (0x03, 0, a[2] / b[2])
-            elif 0x83 == opcode: # f32.eq
-                res = (0x01, a[2] == b[2], 0.0)
-            elif 0x85 == opcode: # f32.lt
-                res = (0x01, a[2] < b[2], 0.0)
-            elif 0x87 == opcode: # f32.gt
-                res = (0x01, a[2] > b[2], 0.0)
+            if VALIDATE: assert a[0] == F32 and b[0] == F32
+            if   0x92 == opcode: # f32.add
+                res = (F32, 0, a[2] + b[2])
+            elif 0x93 == opcode: # f32.sub
+                res = (F32, 0, a[2] - b[2])
+            elif 0x94 == opcode: # f32.mul
+                res = (F32, 0, a[2] * b[2])
+            elif 0x95 == opcode: # f32.div
+                res = (F32, 0, a[2] / b[2])
             else:
-                raise Exception("%s unimplemented"
-                        % OPERATOR_INFO[opcode][0])
-
-#            trace("(%s, %s) = %s" % (
-#                value_repr(a), value_repr(b), value_repr(res)))
-            sp += 1
-            stack[sp] = res
-
-        # f64 unary operations
-        elif opcode in [0x8f, 0x90]:
-            a = stack[sp]
-            sp -= 1
-            assert a[0] == 0x04  # F64
-            if   0x8f == opcode: # f64.abs
-                res = (0x04, 0, abs(a[2]))
-            elif  0x90 == opcode: # f64.neg
-                res = (0x04, 0, -a[2])
-            else:
-                raise Exception("%s unimplemented"
-                        % OPERATOR_INFO[opcode][0])
-#            trace("(%s) = %s" % (
-#                value_repr(a), value_repr(res)))
+                raise Exception("%s(0x%x) unimplemented" % (
+                    OPERATOR_INFO[opcode][0], opcode))
+            if TRACE:
+                debug("      - (%s, %s) = %s" % (
+                    value_repr(a), value_repr(b), value_repr(res)))
             sp += 1
             stack[sp] = res
 
         # f64 binary operations
-        elif 0x89 <= opcode <= 0x9c:
+        elif 0xa0 <= opcode <= 0xa6:
             b, a = stack[sp], stack[sp-1]
             sp -= 2
-            assert a[0] == 0x04 and b[0] == 0x04  # F64 / F64
-            if   0x89 == opcode: # f64.add
-                res = (0x04, 0, a[2] + b[2])
-            elif 0x8a == opcode: # f64.sub
-                res = (0x04, 0, a[2] - b[2])
+            if VALIDATE: assert a[0] == F64 and b[0] == F64
+            if   0xa0 == opcode: # f64.add
+                res = (F64, 0, a[2] + b[2])
+            elif 0xa1 == opcode: # f64.sub
+                res = (F64, 0, a[2] - b[2])
             else:
-                raise Exception("%s unimplemented"
-                        % OPERATOR_INFO[opcode][0])
-
-#            trace("(%s, %s) = %s" % (
-#                value_repr(a), value_repr(b), value_repr(res)))
+                raise Exception("%s(0x%x) unimplemented" % (
+                    OPERATOR_INFO[opcode][0], opcode))
+            if TRACE:
+                debug("      - (%s, %s) = %s" % (
+                    value_repr(a), value_repr(b), value_repr(res)))
             sp += 1
             stack[sp] = res
 
         ## conversion operations
-        #elif 0x9d <= opcode <= 0xb5:
+        elif 0xa7 <= opcode <= 0xbb:
+            a = stack[sp]
+            sp -= 1
 
-        # conversion operations
-        elif 0xa1 == opcode: # i32.wrap/i64
-            a = stack[sp]
-            sp -= 1
-            assert a[0] == 0x02  # I64
-            res = (0x01, a[1], 0.0)
-#            trace("(%s) = %s" % (
-#                value_repr(a), value_repr(res)))
+            # conversion operations
+            if   0xa7 == opcode: # i32.wrap/i64
+                if VALIDATE: assert a[0] == I64
+                res = (I32, a[1], 0.0)
+            elif 0xb0 == opcode: # i64.trunc_s/f64
+                if VALIDATE: assert a[0] == F64
+                res = (I64, int(a[2]), 0.0)
+            elif 0xa6 == opcode: # i64.extend_s/i32
+                if VALIDATE: assert a[0] == I32
+                res = (I64, a[1], 0.0)
+            elif 0xad == opcode: # i64.extend_u/i32
+                if VALIDATE: assert a[0] == I32
+                res = (I64, a[1], 0.0)
+            elif 0xb7 == opcode: # f64.convert_s/i32
+                if VALIDATE: assert a[0] == I32
+                res = (F64, 0, float(a[1]))
+            elif 0xb8 == opcode: # f64.convert_u/i32
+                if VALIDATE: assert a[0] == I32
+                res = (F64, 0, float(a[1]))
+            elif 0xb9 == opcode: # f64.convert_s/i64
+                if VALIDATE: assert a[0] == I64
+                res = (F64, 0, float(a[1]))
+            elif 0xba == opcode: # f64.convert_u/i64
+                if VALIDATE: assert a[0] == I64
+                res = (F64, 0, float(a[1]))
+            elif 0xbb == opcode: # f64.promote/f32
+                if VALIDATE: assert a[0] == F32
+                res = (F64, 0, a[2])
+            else:
+                raise Exception("%s(0x%x) unimplemented" % (
+                    OPERATOR_INFO[opcode][0], opcode))
+            if TRACE:
+                debug("      - (%s) = %s" % (
+                    value_repr(a), value_repr(res)))
             sp += 1
             stack[sp] = res
-        elif 0xa3 == opcode: # i64.trunc_s/f64
+
+        ## reinterpretations
+        elif 0xbc <= opcode <= 0xbf:
             a = stack[sp]
             sp -= 1
-            assert a[0] == 0x04  # F64
-            res = (0x02, int(a[2]), 0.0)
-#            trace("(%s) = %s" % (
-#                value_repr(a), value_repr(res)))
-            sp += 1
-            stack[sp] = res
-        elif 0xa6 == opcode: # i64.extend_s/i32
-            a = stack[sp]
-            sp -= 1
-            assert a[0] == 0x01  # I32
-            res = (0x02, a[1], 0.0)
-#            trace("(%s) = %s" % (
-#                value_repr(a), value_repr(res)))
-            sp += 1
-            stack[sp] = res
-        elif 0xa7 == opcode: # i64.extend_u/i32
-            a = stack[sp]
-            sp -= 1
-            assert a[0] == 0x01  # I32
-            res = (0x02, a[1], 0.0)
-#            trace("(%s) = %s" % (
-#                value_repr(a), value_repr(res)))
-            sp += 1
-            stack[sp] = res
-        elif 0xae == opcode: # f64.convert_s/i32
-            a = stack[sp]
-            sp -= 1
-            assert a[0] == 0x01  # I32
-            res = (0x04, 0, float(a[1]))
-#            trace("(%s) = %s" % (
-#                value_repr(a), value_repr(res)))
-            sp += 1
-            stack[sp] = res
-        elif 0xaf == opcode: # f64.convert_u/i32
-            a = stack[sp]
-            sp -= 1
-            assert a[0] == 0x01  # I32
-            res = (0x04, 0, float(a[1]))
-#            trace("(%s) = %s" % (
-#                value_repr(a), value_repr(res)))
-            sp += 1
-            stack[sp] = res
-        elif 0xb0 == opcode: # f64.convert_s/i64
-            a = stack[sp]
-            sp -= 1
-            assert a[0] == 0x02  # I64
-            res = (0x04, 0, float(a[1]))
-#            trace("(%s) = %s" % (
-#                value_repr(a), value_repr(res)))
-            sp += 1
-            stack[sp] = res
-        elif 0xb1 == opcode: # f64.convert_u/i64
-            a = stack[sp]
-            sp -= 1
-            assert a[0] == 0x02  # I64
-            res = (0x04, 0, float(a[1]))
-#            trace("(%s) = %s" % (
-#                value_repr(a), value_repr(res)))
-            sp += 1
-            stack[sp] = res
-        elif 0xb2 == opcode: # f64.promote/f32
-            a = stack[sp]
-            sp -= 1
-            assert a[0] == 0x03  # F32
-            res = (0x04, 0, a[2])
-#            trace("(%s) = %s" % (
-#                value_repr(a), value_repr(res)))
+
+            # conversion operations
+            if   0xbf == opcode: # f64.reinterpret/i64
+                if VALIDATE: assert a[0] == I64
+                res = (F64, 0, unpack_f64(a[2]))
+            else:
+                raise Exception("%s(0x%x) unimplemented" % (
+                    OPERATOR_INFO[opcode][0], opcode))
+            if TRACE:
+                debug("      - (%s) = %s" % (
+                    value_repr(a), value_repr(res)))
             sp += 1
             stack[sp] = res
 
@@ -1232,8 +1521,8 @@ class Reader():
         return w
 
     def read_bytes(self, cnt):
-        assert cnt >= 0
-        assert self.pos >= 0
+        if VALIDATE: assert cnt >= 0
+        if VALIDATE: assert self.pos >= 0
         bytes = self.bytes[self.pos:self.pos+cnt]
         self.pos += cnt
         return bytes
@@ -1248,7 +1537,7 @@ class Reader():
 
 class Memory():
     def __init__(self, pages=1, bytes=[]):
-        debug("pages: %d" % pages)
+        debug("memory pages: %d" % pages)
         self.pages = pages
         self.bytes = bytes + ([0]*((pages*(2**16))-len(bytes)))
         #self.bytes = [0]*(pages*(2**16))
@@ -1264,29 +1553,6 @@ class Memory():
     def write_byte(self, pos, val):
         self.bytes[pos] = val
 
-    def read_I32(self, pos):
-        return bytes2uint32(self.bytes[pos:pos+4])
-
-    def read_I64(self, pos):
-        return bytes2uint32(self.bytes[pos:pos+8])
-
-    def write_I32(self, pos, val):
-        assert isinstance(pos, int)
-        self.bytes[pos]   = val & 0xff
-        self.bytes[pos+1] = (val & 0xff00)>>8
-        self.bytes[pos+2] = (val & 0xff0000)>>16
-        self.bytes[pos+3] = (val & 0xff000000)>>24
-
-    def write_I64(self, pos, val):
-        assert isinstance(pos, int)
-        self.bytes[pos]   = val & 0xff
-        self.bytes[pos+1] = (val & 0xff00)>>8
-        self.bytes[pos+2] = (val & 0xff0000)>>16
-        self.bytes[pos+3] = (val & 0xff000000)>>24
-        self.bytes[pos+4] = (val & 0xff00000000)>>32
-        self.bytes[pos+5] = (val & 0xff0000000000)>>40
-        self.bytes[pos+6] = (val & 0xff000000000000)>>48
-        self.bytes[pos+7] = (val & 0xff00000000000000)>>56
 
 class Import():
     def __init__(self, module, field, kind, type=0,
@@ -1335,8 +1601,27 @@ class Module():
         self.fp = -1
         self.stack = [(0x00, 0, 0.0)] * STACK_SIZE
         self.bsp = -1
-        block = Block(0x00, BLOCK_TYPE[0x01], 0)
+        block = Block(0x00, BLOCK_TYPE[I32], 0)
         self.blockstack = [(block, -1, -1, 0)] * BLOCKSTACK_SIZE
+        self.start_function = -1
+
+        self.read_magic()
+        self.read_version()
+        self.read_sections()
+
+        self.dump()
+
+        # Run the start function if set
+        if self.start_function >= 0:
+            fidx = self.start_function
+            info("Running start function 0x%x" % fidx)
+            if TRACE:
+                dump_stacks(self.sp, self.stack, self.fp, self.bsp,
+                        self.blockstack)
+            self.rdr.pos, self.sp, self.fp, self.bsp = do_call(
+                    self.stack, self.blockstack, self.sp, self.fp,
+                    self.bsp, self.function[fidx], len(self.rdr.bytes))
+            self.interpret()
 
     def dump(self):
         #debug("raw module data: %s" % self.data)
@@ -1345,10 +1630,7 @@ class Module():
 
         info("Types:")
         for i, t in enumerate(self.type):
-            info("  0x%x [form: %s, params: %s, results: %s]" % (
-                i, VALUE_TYPE[t.form],
-                [VALUE_TYPE[p] for p in t.params],
-                [VALUE_TYPE[r] for r in t.results]))
+            info("  0x%x %s" % (i, type_repr(t)))
 
         info("Imports:")
         for i, imp in enumerate(self.import_list):
@@ -1369,29 +1651,31 @@ class Module():
 
         info("Functions:")
         for i, f in enumerate(self.function):
-            if isinstance(f, FunctionImport):
-                info("  0x%x [type: 0x%x, import: '%s.%s']" % (
-                    i, f.type.index, f.module, f.field))
-            else:
-                info("  0x%x [type: 0x%x, locals: %s, start: 0x%x, end: 0x%x]" % (
-                    i, f.type.index, [VALUE_TYPE[p] for p in f.locals],
-                    f.start, f.end))
+            info("  0x%x %s" % (i, func_repr(f)))
 
         info("Tables:")
-        for t, e in self.table.items():
-            info("  0x%x -> %s" % (t,e))
+        for t, entries in self.table.items():
+            info("  0x%x -> [%s]" % (t,",".join([hex(e) for e in entries])))
+
+        def hexpad(x, cnt):
+            s = "%x" % x
+            return '0' * (cnt-len(s)) + s
+
+        info("Memory:")
+        for r in range(10):
+            info("  0x%s [%s]" % (hexpad(r*16,3),
+                ",".join([hexpad(b,2) for b in self.memory.bytes[r*16:r*16+16]])))
 
         info("Exports:")
         for i, e in enumerate(self.export_list):
-            info("  0x%x [kind: %s, field: %s, index: 0x%x]" % (
-                i, EXTERNAL_KIND_NAMES[e.kind], e.field, e.index))
+            info("  0x%x %s" % (i, export_repr(e)))
         info("")
 
         bl = self.block_map
         block_keys = bl.keys()
         do_sort(block_keys)
         info("block_map: %s" % (
-            ["%s[0x%x->0x%x]" % (sig_repr(bl[k]), bl[k].start, bl[k].end)
+            ["%s[0x%x->0x%x]" % (block_repr(bl[k]), bl[k].start, bl[k].end)
              for k in block_keys]))
         info("")
 
@@ -1414,6 +1698,7 @@ class Module():
         id = self.rdr.read_LEB(7)
         name = SECTION_NAMES[id]
         length = self.rdr.read_LEB(32)
+        debug("parsing %s(%d), length: %d bytes" % (name, id, length))
         if   "Type" == name:     self.parse_Type(length)
         elif "Import" == name:   self.parse_Import(length)
         elif "Function" == name: self.parse_Function(length)
@@ -1446,7 +1731,9 @@ class Module():
             for rc in range(result_count):
                 results.append(self.rdr.read_LEB(32))
             tidx = len(self.type)
-            self.type.append(Type(tidx, form, params, results))
+            t = Type(tidx, form, params, results)
+            debug("  parsed type: %s" % type_repr(t))
+            self.type.append(t)
 
 
     def parse_Import(self, length):
@@ -1496,7 +1783,7 @@ class Module():
     def parse_Table(self, length):
         count = self.rdr.read_LEB(32)
         type = self.rdr.read_LEB(7)
-        assert type == 0x20  # TODO: fix for MVP
+        assert type == ANYFUNC
 
         initial = 1
         for c in range(count):
@@ -1533,10 +1820,12 @@ class Module():
             index = self.rdr.read_LEB(32)
             exp = Export(field, kind, index)
             self.export_list.append(exp)
+            debug("  parsed export: %s" % export_repr(exp))
             self.export_map[field] = exp
 
     def parse_Start(self, length):
-        return self.rdr.read_bytes(length)
+        fidx = self.rdr.read_LEB(32)
+        self.start_function = fidx
 
     def parse_Element(self, length):
         start = self.rdr.pos
@@ -1547,18 +1836,18 @@ class Module():
             assert index == 0  # Only 1 default table in MVP
 
             # Run the init_expr
-            block = Block(0x00, BLOCK_TYPE[0x01], self.rdr.pos)
+            block = Block(0x00, BLOCK_TYPE[I32], self.rdr.pos)
             self.bsp += 1
             self.blockstack[self.bsp] = (block, self.sp, self.fp, 0)
             # WARNING: running code here to get offset!
             self.interpret()  # run iter_expr
             offset_val = self.stack[self.sp]
             self.sp -= 1
-            assert offset_val[0] == 0x01  # I32
+            assert offset_val[0] == I32
             offset = int(offset_val[1])
 
             num_elem = self.rdr.read_LEB(32)
-            table = self.table[0x20]  # TODO: fix for MVP
+            table = self.table[ANYFUNC]
             for n in range(num_elem):
                 fidx = self.rdr.read_LEB(32)
                 table[offset+n] = fidx
@@ -1585,6 +1874,7 @@ class Module():
         func = self.function[idx]
         assert isinstance(func,Function)
         func.update(locals, start, end)
+        debug("  find_blocks start: 0x%x, end: 0x%x" % (start, end))
         self.block_map = find_blocks(
                 self.rdr.bytes, start, end, self.block_map)
 
@@ -1595,11 +1885,28 @@ class Module():
             self.parse_Code_body(idx + import_cnt)
 
     def parse_Data(self, length):
-        return self.rdr.read_bytes(length)
+        seg_count = self.rdr.read_LEB(32)
+        for seg in range(seg_count):
+            index = self.rdr.read_LEB(32)
+            assert index == 0  # Only 1 default table in MVP
 
+            # Run the init_expr
+            block = Block(0x00, BLOCK_TYPE[I32], self.rdr.pos)
+            self.bsp += 1
+            self.blockstack[self.bsp] = (block, self.sp, self.fp, 0)
+            # WARNING: running code here to get offset!
+            self.interpret()  # run iter_expr
+            offset_val = self.stack[self.sp]
+            self.sp -= 1
+            assert offset_val[0] == I32
+            offset = int(offset_val[1])
+
+            size = self.rdr.read_LEB(32)
+            for addr in range(offset, offset+size, 1):
+                self.memory.bytes[addr] = self.rdr.read_byte()
 
     def interpret(self):
-        self.rdr.pos, self.sp = interpret_v12(self,
+        self.rdr.pos, self.sp = interpret_mvp(self,
                 # Greens
                 self.rdr.pos, self.rdr.bytes, self.function,
                 self.table, self.block_map,
@@ -1617,34 +1924,36 @@ class Module():
         fidx = self.export_map[name].index
 
         # Args are strings so convert to expected numeric type
-        # Also reverse order to get correct stack order
         tparams = self.function[fidx].type.params
-        #for idx in range(len(tparams)-1, -1, -1):
         for idx, arg in enumerate(args):
-            arg = args[idx]
+            arg = args[idx].lower()
             assert isinstance(arg, str)
             tname = VALUE_TYPE[tparams[idx]]
-#            print("run arg idx: %d, str: %s, tname: %s" % (idx, arg,
-#                tname))
-            if   tname == "i32": val = (0x01, int(arg), 0.0)
-            elif tname == "i64": val = (0x02, int(arg), 0.0)
-            elif tname == "f32": val = (0x03, 0, float(arg))
-            elif tname == "f64": val = (0x04, 0, float(arg))
+            if   tname == "i32": val = (I32, int(arg), 0.0)
+            elif tname == "i64": val = (I64, int(arg), 0.0)
+            elif tname == "f32":
+                if arg == 'nan': val = (F32, 0, NAN)
+                else:            val = (F32, 0, float(arg))
+            elif tname == "f64":
+                if arg == 'nan': val = (F64, 0, NAN)
+                else:            val = (F64, 0, float(arg))
             else: raise Exception("invalid argument %d: %s" % (
                 idx, arg))
             self.sp += 1
             self.stack[self.sp] = val
 
-        info("Running function %s (0x%x)" % (name, fidx))
-        dump_stacks(self.sp, self.stack, self.fp, self.bsp,
-                self.blockstack)
+        info("Running function '%s' (0x%x)" % (name, fidx))
+        if TRACE:
+            dump_stacks(self.sp, self.stack, self.fp, self.bsp,
+                    self.blockstack)
         self.rdr.pos, self.sp, self.fp, self.bsp = do_call(
                 self.stack, self.blockstack, self.sp, self.fp,
                 self.bsp, self.function[fidx], len(self.rdr.bytes))
 
         self.interpret()
-        dump_stacks(self.sp, self.stack, self.fp, self.bsp,
-                self.blockstack)
+        if TRACE:
+            dump_stacks(self.sp, self.stack, self.fp, self.bsp,
+                    self.blockstack)
         if self.sp >= 0:
             ret = self.stack[self.sp]
             self.sp -= 1
@@ -1685,12 +1994,21 @@ def call_import(mem, module, field, args):
                 value_repr(args[0]), value_repr(args[1])))
         else:
             raise Exception("DEBUG called with > 2 args")
+    elif fname == "spectest.print":
+        assert len(args) == 1
+        assert args[0][0] == I32
+        val = args[0][1]
+        res = ""
+        while val > 0:
+            res = res + chr(val & 0xff)
+            val = val>>8
+        print("%s '%s'" % (value_repr(args[0]), res))
     elif fname == "core.writeline":
         addr = args[0][1]  # I32
         assert addr >= 0
         debug("writeline addr: %s" % addr)
 
-        length = mem.read_I32(addr)
+        length = read_I32(mem.bytes, addr)
         assert length >= 0
         bytes = mem.bytes[addr+4:addr+4+length]
         str = "".join([chr(b) for b in bytes])
@@ -1709,7 +2027,7 @@ def call_import(mem, module, field, args):
             length = len(res)
 
             # first four bytes are length
-            mem.write_I32(addr, 0)
+            write_I32(mem.bytes, addr, 0)
             start = addr+4
 
             pos = start
@@ -1717,11 +2035,11 @@ def call_import(mem, module, field, args):
             for i in range(length):
                 mem.bytes[pos] = ord(res[i])
                 pos += 1
-            mem.write_I32(addr, length)
+            write_I32(mem.bytes, addr, length)
 
-            result.append((0x01, int(length), 0.0))
+            result.append((I32, int(length), 0.0))
         except EOFError:
-            result.append((0x01, int(-1), 0.0))
+            result.append((I32, int(-1), 0.0))
     else:
         raise Exception("invalid import %s.%s" % (module, field))
     return result
@@ -1747,11 +2065,6 @@ def entry_point(argv):
         #
 
         m = Module(wasm, call_import, {})
-        m.read_magic()
-        m.read_version()
-        m.read_sections()
-
-        m.dump()
 
         # Args are strings at this point
         res = m.run(entry, args)
@@ -1764,13 +2077,15 @@ def entry_point(argv):
                 entry, ",".join(args)))
 
     except WAException as e:
-        print("%s" % e.message)
+        if not IS_RPYTHON:
+            os.write(2, "".join(traceback.format_exception(*sys.exc_info())))
+        os.write(2, "%s\n" % e.message)
         return 1
 
     except Exception as e:
         if IS_RPYTHON:
             llop.debug_print_traceback(lltype.Void)
-            os.write(2, "Exception: %s" % e)
+            os.write(2, "Exception: %s\n" % e)
         else:
             os.write(2, "".join(traceback.format_exception(*sys.exc_info())))
         return 1
