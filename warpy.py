@@ -15,6 +15,8 @@ if IS_RPYTHON:
     from rpython.rlib.listsort import TimSort
     from rpython.rlib.rstruct.ieee import float_unpack, float_pack
     from rpython.rlib.rfloat import round_double
+    from rpython.rlib.rarithmetic import (
+            intmask, string_to_int)
 
     class IntSort(TimSort):
         def lt(self, a, b):
@@ -56,13 +58,17 @@ else:
         a.sort()
 
     def unpack_f32(i32):
-        return struct.unpack('f', struct.pack('I', i32))[0]
+        return struct.unpack('f', struct.pack('i', i32))[0]
     def unpack_f64(i64):
         return struct.unpack('d', struct.pack('q', i64))[0]
     def pack_f32(f32):
-        return struct.unpack('I', struct.pack('f', f32))[0]
+        return struct.unpack('i', struct.pack('f', f32))[0]
     def pack_f64(f64):
         return struct.unpack('q', struct.pack('d', f64))[0]
+
+    def intmask(i): return i
+
+    def string_to_int(s, base=10): return int(s, base)
 
     def fround(val, digits):
         return round(val, digits)
@@ -82,9 +88,6 @@ VALIDATE= True
 class WAException(Exception):
     def __init__(self, message):
         self.message = message
-
-# float('nan') does not work in rpython
-NAN = abs((1e200 * 1e200) / (1e200 * 1e200))
 
 class Type():
     def __init__(self, index, form, params, results):
@@ -140,8 +143,8 @@ class FunctionImport(Code):
 MAGIC = 0x6d736100
 VERSION = 0x01  # MVP
 
-STACK_SIZE      = 65536
-BLOCKSTACK_SIZE = 8192
+STACK_SIZE     = 65536
+CALLSTACK_SIZE = 8192
 
 I32     = 0x7f  # -0x01
 I64     = 0x7e  # -0x02
@@ -159,7 +162,7 @@ VALUE_TYPE = { I32     : 'i32',
                FUNC    : 'func',
                BLOCK   : 'block_type' }
 
-# Block signatures for blocks, loops, ifs
+# Block types/signatures for blocks, loops, ifs
 BLOCK_TYPE = { I32   : Type(-1, BLOCK, [], [I32]),
                I64   : Type(-1, BLOCK, [], [I64]),
                F32   : Type(-1, BLOCK, [], [F32]),
@@ -333,8 +336,8 @@ OPERATOR_INFO = {
         0x72 : ['i32.or',         ''],
         0x73 : ['i32.xor',        ''],
         0x74 : ['i32.shl',        ''],
-        0x75 : ['i32.shr_u',      ''],
-        0x76 : ['i32.shr_s',      ''],
+        0x75 : ['i32.shr_s',      ''],
+        0x76 : ['i32.shr_u',      ''],
         0x77 : ['i32.rotl',       ''],
         0x78 : ['i32.rotr',       ''],
 
@@ -420,6 +423,21 @@ OPERATOR_INFO = {
         0xbf : ['f64.reinterpret/i64', ''],
         }
 
+LOAD_SIZE = { 0x28 : 4,
+              0x29 : 8,
+              0x2a : 4,
+              0x2b : 8,
+              0x2c : 1,
+              0x2d : 1,
+              0x2e : 2,
+              0x2f : 2,
+              0x30 : 1,
+              0x31 : 1,
+              0x32 : 2,
+              0x33 : 2,
+              0x34 : 4,
+              0x35 : 4 }
+
 
 ######################################
 # General Functions
@@ -434,6 +452,81 @@ def debug(str, end='\n'):
     if DEBUG:
         os.write(2, str + end)
         #if end == '': sys.stderr.flush()
+
+
+# math functions
+
+def unpack_nan32(i32):
+    if IS_RPYTHON:
+        return float_unpack(i32, 4)
+    else:
+        return struct.unpack('f', struct.pack('I', i32))[0]
+def unpack_nan64(i64):
+    if IS_RPYTHON:
+        return float_unpack(i64, 8)
+    else:
+        return struct.unpack('d', struct.pack('Q', i64))[0]
+
+@elidable
+def parse_nan(type, arg):
+    if   type == F32: v = unpack_nan32(0x7fc00000)
+    else:             v = unpack_nan64(0x7ff8000000000000)
+    return v
+
+@elidable
+def parse_number(type, arg):
+    if   type == I32:
+        if   arg[0:2] == '0x':   v = (I32, string_to_int(arg,16), 0.0)
+        elif arg[0:3] == '-0x':  v = (I32, string_to_int(arg,16), 0.0)
+        else:                    v = (I32, string_to_int(arg,10), 0.0)
+    elif type == I64:
+        if arg[0:2] == '0x':     v = (I64, string_to_int(arg,16), 0.0)
+        elif arg[0:3] == '-0x':  v = (I64, string_to_int(arg,16), 0.0)
+        else:                    v = (I64, string_to_int(arg,10), 0.0)
+    elif type == F32:
+        if   arg.find('nan')>=0: v = (F32, 0, parse_nan(type, arg))
+#        elif arg[0:2] == '0x':   v = (F32, 0, float.fromhex(arg))
+#        elif arg[0:3] == '-0x':  v = (F32, 0, float.fromhex(arg))
+        else:                    v = (F32, 0, float(arg))
+    elif type == F64:
+        if   arg.find('nan')>=0: v = (F64, 0, parse_nan(type, arg))
+#        elif arg[0:2] == '0x':   v = (F64, 0, float.fromhex(arg))
+#        elif arg[0:3] == '-0x':  v = (F64, 0, float.fromhex(arg))
+        else:                    v = (F64, 0, float(arg))
+    else:
+        raise Exception("invalid number %s" % arg)
+    return v
+
+# Integer division that rounds towards 0 (like C)
+@elidable
+def idiv_s(a,b):
+    return a//b if a*b>0 else (a+(-a%b))//b
+
+@elidable
+def irem_s(a,b):
+    return a%b if a*b>0 else -(-a%b)
+
+#
+
+@elidable
+def rotl32(a,cnt):
+    return (((a << (cnt % 0x20)) & 0xffffffff)
+            | (a >> (0x20 - (cnt % 0x20))))
+
+@elidable
+def rotr32(a,cnt):
+    return ((a >> (cnt % 0x20))
+            | ((a << (0x20 - (cnt % 0x20))) & 0xffffffff))
+
+@elidable
+def rotl64(a,cnt):
+    return (((a << (cnt % 0x40)) & 0xffffffffffffffff)
+            | (a >> (0x40 - (cnt % 0x40))))
+
+@elidable
+def rotr64(a,cnt):
+    return ((a >> (cnt % 0x40))
+            | ((a << (0x40 - (cnt % 0x40))) & 0xffffffffffffffff))
 
 @elidable
 def bytes2uint8(b):
@@ -469,14 +562,26 @@ def bytes2uint32(b):
 
 @elidable
 def uint322bytes(v):
-    return ( v & 0xff,
-            (v & 0xff00)>>8,
-            (v & 0xff0000)>>16,
-            (v & 0xff000000)>>24)
+    return [0xff & (v),
+            0xff & (v>>8),
+            0xff & (v>>16),
+            0xff & (v>>24)]
 
 @elidable
 def bytes2int32(b):
     val = (b[3]<<24) + (b[2]<<16) + (b[1]<<8) + b[0]
+    if val & 0x80000000:
+        return val - 0x100000000
+    else:
+        return val
+
+@elidable
+def int2uint32(i):
+    return i & 0xffffffff
+
+@elidable
+def int2int32(i):
+    val = i & 0xffffffff
     if val & 0x80000000:
         return val - 0x100000000
     else:
@@ -491,14 +596,49 @@ def bytes2uint64(b):
 
 @elidable
 def uint642bytes(v):
-    return ( v & 0xff,
-            (v & 0xff00)>>8,
-            (v & 0xff0000)>>16,
-            (v & 0xff000000)>>24,
-            (v & 0xff00000000)>>32,
-            (v & 0xff0000000000)>>40,
-            (v & 0xff000000000000)>>48,
-            (v & 0xff00000000000000)>>56)
+    return [0xff & (v),
+            0xff & (v>>8),
+            0xff & (v>>16),
+            0xff & (v>>24),
+            0xff & (v>>32),
+            0xff & (v>>40),
+            0xff & (v>>48),
+            0xff & (v>>56)]
+
+if IS_RPYTHON:
+    @elidable
+    def bytes2int64(b):
+        return bytes2uint64(b)
+else:
+    def bytes2int64(b):
+        val = ((b[7]<<56) + (b[6]<<48) + (b[5]<<40) + (b[4]<<32) +
+                (b[3]<<24) + (b[2]<<16) + (b[1]<<8) + b[0])
+        if val & 0x8000000000000000:
+            return val - 0x10000000000000000
+        else:
+            return val
+
+#
+
+if IS_RPYTHON:
+    @elidable
+    def int2uint64(i):
+        return intmask(i)
+else:
+    def int2uint64(i):
+        return i & 0xffffffffffffffff
+
+if IS_RPYTHON:
+    @elidable
+    def int2int64(i):
+        return i
+else:
+    def int2int64(i):
+        val = i & 0xffffffffffffffff
+        if val & 0x8000000000000000:
+            return val - 0x10000000000000000
+        else:
+            return val
 
 # https://en.wikipedia.org/wiki/LEB128
 @elidable
@@ -527,21 +667,25 @@ def read_LEB(bytes, pos, maxbits=32, signed=False):
 
 @elidable
 def read_I32(bytes, pos):
+    assert pos >= 0
     return bytes2uint32(bytes[pos:pos+4])
 
 @elidable
 def read_I64(bytes, pos):
-    return bytes2uint32(bytes[pos:pos+8])
+    assert pos >= 0
+    return bytes2uint64(bytes[pos:pos+8])
 
 @elidable
 def read_F32(bytes, pos):
-    bits = bytes2uint32(bytes[pos:pos+4])
+    assert pos >= 0
+    bits = bytes2int32(bytes[pos:pos+4])
     return fround(unpack_f32(bits), 5)
 
 @elidable
 def read_F64(bytes, pos):
-    bits = bytes2uint64(bytes[pos:pos+8])
-    return unpack_f64(sys.maxint & bits)
+    assert pos >= 0
+    bits = bytes2int64(bytes[pos:pos+8])
+    return unpack_f64(bits)
 
 def write_I32(bytes, pos, ival):
     bytes[pos:pos+4] = uint322bytes(ival)
@@ -550,11 +694,11 @@ def write_I64(bytes, pos, ival):
     bytes[pos:pos+8] = uint642bytes(ival)
 
 def write_F32(bytes, pos, fval):
-    ival = pack_f32(fval)
+    ival = intmask(pack_f32(fval))
     bytes[pos:pos+4] = uint322bytes(ival)
 
 def write_F64(bytes, pos, fval):
-    ival = pack_f64(fval)
+    ival = intmask(pack_f64(fval))
     bytes[pos:pos+8] = uint642bytes(ival)
 
 
@@ -564,7 +708,11 @@ def value_repr(val):
     if   vtn in ('i32', 'i64'):
         return "%s:%s" % (hex(ival), vtn)
     elif vtn in ('f32', 'f64'):
-        return "%f:%s" % (fval, vtn)
+        if IS_RPYTHON:
+            # TODO: fix this to be like python
+            return "%f:%s" % (fval, vtn)
+        else:
+            return "%.7g:%s" % (fval, vtn)
     else:
         raise Exception("unknown value type %s" % vtn)
 
@@ -574,7 +722,7 @@ def type_repr(t):
         [VALUE_TYPE[r] for r in t.results])
 
 def export_repr(e):
-    return "<kind: %s, field: %s, index: 0x%x>" % (
+    return "<kind: %s, field: '%s', index: 0x%x>" % (
             EXTERNAL_KIND_NAMES[e.kind], e.field, e.index)
 
 def func_repr(f):
@@ -604,16 +752,16 @@ def stack_repr(sp, fp, stack):
         res.append(value_repr(stack[i]))
     return "[" + " ".join(res) + "]"
 
-def blockstack_repr(bsp, bs):
+def callstack_repr(csp, bs):
     return "[" + " ".join(["%s(sp:0x%x/fp:0x%x/ra:0x%x)" % (
         block_repr(bs[i][0]),bs[i][1],bs[i][2],bs[i][3])
-                           for i in range(bsp+1)]) + "]"
+                           for i in range(csp+1)]) + "]"
 
-def dump_stacks(sp, stack, fp, bsp, blockstack):
-    debug("      * stack:       %s" % (
+def dump_stacks(sp, stack, fp, csp, callstack):
+    debug("      * stack:     %s" % (
         stack_repr(sp, fp, stack)))
-    debug("      * blockstack:  %s" % (
-        blockstack_repr(bsp, blockstack)))
+    debug("      * callstack: %s" % (
+        callstack_repr(csp, callstack)))
 
 def byte_code_repr(bytes):
     res = []
@@ -656,7 +804,7 @@ def skip_immediates(code, pos):
         vals.append(read_F64(code, pos))
         pos += 8
     elif 'block_type' == imtype:
-        pos, v = read_LEB(code, pos, 7)  # block signature
+        pos, v = read_LEB(code, pos, 7)  # block type signature
         vals.append(v)
     elif 'memory_immediate' == imtype:
         pos, v = read_LEB(code, pos, 32)  # flags
@@ -695,8 +843,7 @@ def find_blocks(code, start, end, block_map):
         #    pos, OPERATOR_INFO[opcode][0],
         #    ["%d,%s,0x%x" % (o,s.index,p) for o,s,p in opstack]))
         if   0x02 <= opcode <= 0x04:  # block, loop, if
-            block_sig = BLOCK_TYPE[code[pos+1]]
-            block = Block(opcode, block_sig, pos)
+            block = Block(opcode, BLOCK_TYPE[code[pos+1]], pos)
             opstack.append(block)
             block_map[pos] = block
         elif 0x05 == opcode:  # mark else positions
@@ -720,9 +867,9 @@ def find_blocks(code, start, end, block_map):
     return block_map
 
 @unroll_safe
-def pop_block(stack, blockstack, sp, fp, bsp):
-    block, orig_sp, orig_fp, ra = blockstack[bsp]
-    bsp -= 1
+def pop_block(stack, callstack, sp, fp, csp):
+    block, orig_sp, orig_fp, ra = callstack[csp]
+    csp -= 1
     t = block.type
 
     # Validate return value if there is one
@@ -752,25 +899,16 @@ def pop_block(stack, blockstack, sp, fp, bsp):
         if orig_sp < sp:
             sp = orig_sp
 
-    return block, ra, sp, orig_fp, bsp
+    return block, ra, sp, orig_fp, csp
 
 @unroll_safe
-def do_branch(stack, blockstack, sp, fp, bsp, depth):
-    if VALIDATE: assert bsp+1 > depth
-    target_block, _, fp, _ = blockstack[bsp-depth]
-    for r in range(depth):
-        block, _, sp, fp, bsp = pop_block(stack, blockstack,
-                sp, fp, bsp)
-    return target_block.br_addr, sp, fp, bsp
+def do_call(stack, callstack, sp, fp, csp, func, pc):
 
-@unroll_safe
-def do_call(stack, blockstack, sp, fp, bsp, func, pc):
-
-    # Push block, stack size and return address onto blockstack
+    # Push block, stack size and return address onto callstack
     t = func.type
-    if VALIDATE: assert bsp < BLOCKSTACK_SIZE, "call stack exhausted"
-    bsp += 1
-    blockstack[bsp] = (func, sp-len(t.params), fp, pc)
+    if VALIDATE: assert csp < CALLSTACK_SIZE, "call stack exhausted"
+    csp += 1
+    callstack[csp] = (func, sp-len(t.params), fp, pc)
 
     # Update the pos/instruction counter to the function
     pc = func.start
@@ -795,14 +933,14 @@ def do_call(stack, blockstack, sp, fp, bsp, func, pc):
         sp += 1
         stack[sp] = (ltype, 0, 0.0)
 
-    return pc, sp, fp, bsp
+    return pc, sp, fp, csp
 
 
 @unroll_safe
 def do_call_import(stack, sp, memory, host_import_func, func):
     t = func.type
 
-    # make sure args match signature
+    # make sure args match type signature
     args = []
     for idx in range(len(t.params)-1, -1, -1):
         arg = stack[sp]
@@ -820,7 +958,7 @@ def do_call_import(stack, sp, memory, host_import_func, func):
     results.extend(host_import_func(memory,
             func.module, func.field, args))
 
-    # make sure returns match signature
+    # make sure returns match type signature
     for idx, rtype in enumerate(t.results):
         if idx < len(results):
             res = results[idx]
@@ -848,6 +986,10 @@ def get_function(function, fidx):
     return function[fidx]
 
 @elidable
+def bound_violation(opcode, addr, pages):
+    return addr+LOAD_SIZE[opcode] > pages*(2**16)
+
+@elidable
 def get_from_table(table, tidx, table_index):
     tbl = table[tidx]
     if table_index < 0 or table_index >= len(tbl):
@@ -859,15 +1001,15 @@ if IS_RPYTHON:
     jitdriver = JitDriver(
             greens=['opcode', 'pc',
                     'code', 'function', 'table', 'block_map'],
-            reds=['sp', 'fp', 'bsp',
-                  'module', 'memory', 'stack', 'blockstack'],
+            reds=['sp', 'fp', 'csp',
+                  'module', 'memory', 'stack', 'callstack'],
             get_printable_location=get_location_str)
 
 def interpret_mvp(module,
         # Greens
         pc, code, function, table, block_map,
         # Reds
-        memory, sp, stack, fp, bsp, blockstack):
+        memory, sp, stack, fp, csp, callstack):
 
     while pc < len(code):
         opcode = code[pc]
@@ -881,15 +1023,15 @@ def interpret_mvp(module,
                     table=table,
                     block_map=block_map,
                     # Reds
-                    sp=sp, fp=fp, bsp=bsp,
+                    sp=sp, fp=fp, csp=csp,
                     module=module, memory=memory,
-                    stack=stack, blockstack=blockstack)
+                    stack=stack, callstack=callstack)
 
         cur_pc = pc
         pc += 1
 
         if TRACE:
-            dump_stacks(sp, stack, fp, bsp, blockstack)
+            dump_stacks(sp, stack, fp, csp, callstack)
             _, immediates = skip_immediates(code, cur_pc)
             info("    0x%x <0x%x/%s%s%s>" % (
                 cur_pc, opcode, OPERATOR_INFO[opcode][0],
@@ -906,27 +1048,27 @@ def interpret_mvp(module,
         elif 0x02 == opcode:  # block
             pc, ignore = read_LEB(code, pc, 32) # ignore block_type
             block = get_block(block_map, cur_pc)
-            bsp += 1
-            blockstack[bsp] = (block, sp, fp, 0)
+            csp += 1
+            callstack[csp] = (block, sp, fp, 0)
             if TRACE: debug("      - block: %s" % block_repr(block))
         elif 0x03 == opcode:  # loop
             pc, ignore = read_LEB(code, pc, 32) # ignore block_type
             block = get_block(block_map, cur_pc)
-            bsp += 1
-            blockstack[bsp] = (block, sp, fp, 0)
+            csp += 1
+            callstack[csp] = (block, sp, fp, 0)
             if TRACE: debug("      - block: %s" % block_repr(block))
         elif 0x04 == opcode:  # if
             pc, ignore = read_LEB(code, pc, 32) # ignore block_type
             block = get_block(block_map, cur_pc)
-            bsp += 1
-            blockstack[bsp] = (block, sp, fp, 0)
+            csp += 1
+            callstack[csp] = (block, sp, fp, 0)
             cond = stack[sp]
             sp -= 1
             if not cond[1]:  # if false (I32)
                 # branch to else block or after end of if
                 if block.else_addr == 0:
                     # no else block so pop if block and skip end
-                    bsp -= 1
+                    csp -= 1
                     pc = block.br_addr+1
                 else:
                     pc = block.else_addr
@@ -934,19 +1076,19 @@ def interpret_mvp(module,
                 debug("      - cond: %s jump to 0x%x, block: %s" % (
                     value_repr(cond), pc, block_repr(block)))
         elif 0x05 == opcode:  # else
-            block = blockstack[bsp][0]
+            block = callstack[csp][0]
             pc = block.br_addr
             if TRACE:
                 debug("      - of %s jump to 0x%x" % (
                     block_repr(block), pc))
         elif 0x0b == opcode:  # end
-            block, ra, sp, fp, bsp = pop_block(stack, blockstack, sp,
-                    fp, bsp)
+            block, ra, sp, fp, csp = pop_block(stack, callstack, sp,
+                    fp, csp)
             if TRACE: debug("      - of %s" % block_repr(block))
             if isinstance(block, Function):
                 # Return to return address
                 pc = ra
-                if bsp == -1:
+                if csp == -1:
                     # Return to top-level, ignoring return_addr
                     return pc, sp
                 else:
@@ -959,17 +1101,19 @@ def interpret_mvp(module,
             else:
                 pass # end of block/loop/if, keep going
         elif 0x0c == opcode:  # br
-            pc, relative_depth = read_LEB(code, pc, 32)
-            pc, sp, fp, bsp = do_branch(stack, blockstack, sp, fp,
-                    bsp, relative_depth)
+            pc, br_depth = read_LEB(code, pc, 32)
+            csp -= br_depth
+            block, _, _, _ = callstack[csp]
+            pc = block.br_addr # set to end for pop_block
             if TRACE: debug("      - to: 0x%x" % pc)
         elif 0x0d == opcode:  # br_if
-            pc, relative_depth = read_LEB(code, pc, 32)
+            pc, br_depth = read_LEB(code, pc, 32)
             cond = stack[sp]
             sp -= 1
             if cond[1]:  # I32
-                pc, sp, fp, bsp = do_branch(stack, blockstack, sp, fp,
-                        bsp, relative_depth)
+                csp -= br_depth
+                block, _, _, _ = callstack[csp]
+                pc = block.br_addr # set to end for pop_block
             if TRACE:
                 debug("      - cond: %s, to: 0x%x" % (cond[1], pc))
         elif 0x0e == opcode:  # br_table
@@ -978,32 +1122,33 @@ def interpret_mvp(module,
             for c in range(target_count):
                 pc, depth = read_LEB(code, pc, 32)
                 depths.append(depth)
-            pc, depth = read_LEB(code, pc, 32) # default
+            pc, br_depth = read_LEB(code, pc, 32) # default
             expr = stack[sp]
             sp -= 1
             if VALIDATE: assert expr[0] == I32
             didx = expr[1]  # I32
             if didx >= 0 and didx < len(depths):
-                depth = depths[didx]
-            pc, sp, fp, bsp = do_branch(stack, blockstack, sp, fp,
-                    bsp, depth)
+                br_depth = depths[didx]
+            csp -= br_depth
+            block, _, _, _ = callstack[csp]
+            pc = block.br_addr # set to end for pop_block
             if TRACE:
                 debug("      - depths: %s, didx: %d, to: 0x%x" % (
                     depths, didx, pc))
         elif 0x0f == opcode:  # return
             # Pop blocks until reach Function signature
-            while bsp >= 0:
-                if isinstance(blockstack[bsp][0], Function): break
-                # We don't use pop_sig because the end opcode
+            while csp >= 0:
+                if isinstance(callstack[csp][0], Function): break
+                # We don't use pop_block because the end opcode
                 # handler will do this for us and catch the return
                 # value properly.
-                block = blockstack[bsp]
-                bsp -= 1
-            if VALIDATE: assert bsp >= 0
-            block = blockstack[bsp][0]
+                block = callstack[csp]
+                csp -= 1
+            if VALIDATE: assert csp >= 0
+            block = callstack[csp][0]
             if VALIDATE: assert isinstance(block, Function)
             # Set instruction pointer to end of function
-            # The actual pop_sig and return is handled by handling
+            # The actual pop_block and return is handled by handling
             # the end opcode
             pc = block.end
             if TRACE: debug("      - to 0x%x" % block.br_addr)
@@ -1024,8 +1169,8 @@ def interpret_mvp(module,
                 sp = do_call_import(stack, sp, memory,
                         module.host_import_func, func)
             elif isinstance(func, Function):
-                pc, sp, fp, bsp = do_call(stack, blockstack, sp, fp,
-                        bsp, func, pc)
+                pc, sp, fp, csp = do_call(stack, callstack, sp, fp,
+                        csp, func, pc)
                 if TRACE: debug("      - calling function fidx: %d"
                                 " at: 0x%x" % (fidx, pc))
         elif 0x11 == opcode:  # call_indirect
@@ -1039,7 +1184,7 @@ def interpret_mvp(module,
             promote(table_index)
             fidx = get_from_table(table, ANYFUNC, table_index)
             promote(fidx)
-            pc, sp, fp, bsp = do_call(stack, blockstack, sp, fp, bsp,
+            pc, sp, fp, csp = do_call(stack, callstack, sp, fp, csp,
                     get_function(function, fidx), pc)
             if TRACE:
                 debug("      - table idx: 0x%x, tidx: 0x%x,"
@@ -1083,9 +1228,16 @@ def interpret_mvp(module,
             stack[fp+arg] = val
             if TRACE: debug("      - to %s" % value_repr(val))
         elif 0x23 == opcode:  # get_global
-            raise Exception("get_global unimplemented")
+            pc, gidx = read_LEB(code, pc, 32)
+            sp += 1
+            stack[sp] = module.global_list[gidx]
+            if TRACE: debug("      - got %s" % value_repr(stack[sp]))
         elif 0x24 == opcode:  # set_global
-            raise Exception("set_global unimplemented")
+            pc, gidx = read_LEB(code, pc, 32)
+            val = stack[sp]
+            sp -= 1
+            module.global_list[gidx] = val
+            if TRACE: debug("      - to %s" % value_repr(val))
 
         #
         # Memory-related operators
@@ -1103,37 +1255,40 @@ def interpret_mvp(module,
                          " offset: 0x%x, addr: 0x%x" % (
                              flags, offset, addr_val[1]))
             addr = addr_val[1] + offset
-            try:
-                if   0x28 == opcode:  # i32.load
-                    res = (I32, read_I32(memory.bytes, addr), 0.0)
-                elif 0x29 == opcode:  # i64.load
-                    res = (I64, read_I64(memory.bytes, addr), 0.0)
-                elif 0x2a == opcode:  # f32.load
-                    res = (F32, 0, read_F32(memory.bytes, addr))
-                elif 0x2b == opcode:  # f64.load
-                    res = (F64, 0, read_F64(memory.bytes, addr))
-                elif 0x2c == opcode:  # i32.load8_s
-                    res = (I32, bytes2int8(memory.bytes[addr:addr+1]), 0.0)
-                elif 0x2d == opcode:  # i32.load8_u
-                    res = (I32, memory.bytes[addr], 0.0)
-                elif 0x2e == opcode:  # i32.load16_s
-                    res = (I32, bytes2int16(memory.bytes[addr:addr+2]), 0.0)
-                elif 0x2f == opcode:  # i32.load16_u
-                    res = (I32, bytes2uint16(memory.bytes[addr:addr+2]), 0.0)
-                elif 0x30 == opcode:  # i64.load8_s
-                    res = (I64, bytes2int8(memory.bytes[addr:addr+1]), 0.0)
-                elif 0x31 == opcode:  # i64.load8_u
-                    res = (I64, memory.bytes[addr], 0.0)
-                elif 0x32 == opcode:  # i64.load16_s
-                    res = (I64, bytes2int16(memory.bytes[addr:addr+2]), 0.0)
-                elif 0x33 == opcode:  # i64.load16_u
-                    res = (I64, bytes2uint16(memory.bytes[addr:addr+2]), 0.0)
-                elif 0x34 == opcode:  # i64.load32_s
-                    res = (I64, bytes2int32(memory.bytes[addr:addr+4]), 0.0)
-                elif 0x35 == opcode:  # i64.load32_u
-                    res = (I64, bytes2uint32(memory.bytes[addr:addr+4]), 0.0)
-            except IndexError:
+            assert addr >= 0
+            if bound_violation(opcode, addr, memory.pages):
                 raise WAException("out of bounds memory access")
+            if   0x28 == opcode:  # i32.load
+                res = (I32, bytes2uint32(memory.bytes[addr:addr+4]), 0.0)
+            elif 0x29 == opcode:  # i64.load
+                res = (I64, bytes2uint64(memory.bytes[addr:addr+8]), 0.0)
+            elif 0x2a == opcode:  # f32.load
+                res = (F32, 0, read_F32(memory.bytes, addr))
+            elif 0x2b == opcode:  # f64.load
+                res = (F64, 0, read_F64(memory.bytes, addr))
+            elif 0x2c == opcode:  # i32.load8_s
+                res = (I32, bytes2int8(memory.bytes[addr:addr+1]), 0.0)
+            elif 0x2d == opcode:  # i32.load8_u
+                res = (I32, memory.bytes[addr], 0.0)
+            elif 0x2e == opcode:  # i32.load16_s
+                res = (I32, bytes2int16(memory.bytes[addr:addr+2]), 0.0)
+            elif 0x2f == opcode:  # i32.load16_u
+                res = (I32, bytes2uint16(memory.bytes[addr:addr+2]), 0.0)
+            elif 0x30 == opcode:  # i64.load8_s
+                res = (I64, bytes2int8(memory.bytes[addr:addr+1]), 0.0)
+            elif 0x31 == opcode:  # i64.load8_u
+                res = (I64, memory.bytes[addr], 0.0)
+            elif 0x32 == opcode:  # i64.load16_s
+                res = (I64, bytes2int16(memory.bytes[addr:addr+2]), 0.0)
+            elif 0x33 == opcode:  # i64.load16_u
+                res = (I64, bytes2uint16(memory.bytes[addr:addr+2]), 0.0)
+            elif 0x34 == opcode:  # i64.load32_s
+                res = (I64, bytes2int32(memory.bytes[addr:addr+4]), 0.0)
+            elif 0x35 == opcode:  # i64.load32_u
+                res = (I64, bytes2uint32(memory.bytes[addr:addr+4]), 0.0)
+            else:
+                raise WAException("%s(0x%x) unimplemented" % (
+                    OPERATOR_INFO[opcode][0], opcode))
             sp += 1
             stack[sp] = res
 
@@ -1151,10 +1306,13 @@ def interpret_mvp(module,
                          " offset: 0x%x, addr: 0x%x, val: 0x%x" % (
                              flags, offset, addr_val[1], val[1]))
             addr = addr_val[1] + offset
+            assert addr >= 0
             if   0x36 == opcode:  # i32.store
                 write_I32(memory.bytes, addr, val[1])
             elif 0x37 == opcode:  # i64.store
                 write_I64(memory.bytes, addr, val[1])
+            elif 0x38 == opcode:  # f32.store
+                write_F32(memory.bytes, addr, val[2])
             elif 0x39 == opcode:  # f64.store
                 write_F64(memory.bytes, addr, val[2])
             elif 0x3a == opcode:  # i32.store8
@@ -1173,7 +1331,7 @@ def interpret_mvp(module,
                 memory.bytes[addr+2] = (val[1] & 0x00ff0000)>>16
                 memory.bytes[addr+3] = (val[1] & 0xff000000)>>24
             else:
-                raise Exception("%s(0x%x) unimplemented" % (
+                raise WAException("%s(0x%x) unimplemented" % (
                     OPERATOR_INFO[opcode][0], opcode))
 
         # Memory size operators
@@ -1216,7 +1374,7 @@ def interpret_mvp(module,
             pc += 8
             if TRACE: debug("      - %s" % value_repr(stack[sp]))
 
-        # 
+        #
         # Comparison operators
         #
 
@@ -1231,7 +1389,7 @@ def interpret_mvp(module,
                 if VALIDATE: assert a[0] == I64
                 res = (I32, a[1] == 0, 0.0)
             else:
-                raise Exception("%s(0x%x) unimplemented" % (
+                raise WAException("%s(0x%x) unimplemented" % (
                     OPERATOR_INFO[opcode][0], opcode))
             if TRACE:
                 debug("      - (%s) = %s" % (
@@ -1251,54 +1409,96 @@ def interpret_mvp(module,
                 res = (I32, a[1] != b[1], 0.0)
             elif 0x48 == opcode: # i32.lt_s
                 if VALIDATE: assert a[0] == I32 and b[0] == I32
-                res = (I32, a[1] < b[1], 0.0)
+                res = (I32, int2int32(a[1]) < int2int32(b[1]), 0.0)
             elif 0x49 == opcode: # i32.lt_u
                 if VALIDATE: assert a[0] == I32 and b[0] == I32
-                res = (I32, a[1] < b[1], 0.0)
+                res = (I32, int2uint32(a[1]) < int2uint32(b[1]), 0.0)
+            elif 0x4a == opcode: # i32.gt_s
+                if VALIDATE: assert a[0] == I32 and b[0] == I32
+                res = (I32, int2int32(a[1]) > int2int32(b[1]), 0.0)
             elif 0x4b == opcode: # i32.gt_u
                 if VALIDATE: assert a[0] == I32 and b[0] == I32
-                res = (I32, a[1] > b[1], 0.0)
+                res = (I32, int2uint32(a[1]) > int2uint32(b[1]), 0.0)
             elif 0x4c == opcode: # i32.le_s
                 if VALIDATE: assert a[0] == I32 and b[0] == I32
-                res = (I32, a[1] <= b[1], 0.0)
+                res = (I32, int2int32(a[1]) <= int2int32(b[1]), 0.0)
             elif 0x4d == opcode: # i32.le_u
                 if VALIDATE: assert a[0] == I32 and b[0] == I32
-                res = (I32, a[1] <= b[1], 0.0)
+                res = (I32, int2uint32(a[1]) <= int2uint32(b[1]), 0.0)
+            elif 0x4e == opcode: # i32.ge_s
+                if VALIDATE: assert a[0] == I32 and b[0] == I32
+                res = (I32, int2int32(a[1]) >= int2int32(b[1]), 0.0)
+            elif 0x4f == opcode: # i32.ge_u
+                if VALIDATE: assert a[0] == I32 and b[0] == I32
+                res = (I32, int2uint32(a[1]) >= int2uint32(b[1]), 0.0)
             elif 0x51 == opcode: # i64.eq
                 if VALIDATE: assert a[0] == I64 and b[0] == I64
                 res = (I32, a[1] == b[1], 0.0)
+            elif 0x52 == opcode: # i64.ne
+                if VALIDATE: assert a[0] == I64 and b[0] == I64
+                res = (I32, a[1] != b[1], 0.0)
             elif 0x53 == opcode: # i64.lt_s
                 if VALIDATE: assert a[0] == I64 and b[0] == I64
-                res = (I32, a[1] < b[1], 0.0)
+                res = (I32, int2int64(a[1]) < int2int64(b[1]), 0.0)
+            elif 0x54 == opcode: # i64.lt_u
+                if VALIDATE: assert a[0] == I64 and b[0] == I64
+                res = (I32, int2uint64(a[1]) < int2uint64(b[1]), 0.0)
             elif 0x55 == opcode: # i64.gt_s
                 if VALIDATE: assert a[0] == I64 and b[0] == I64
-                res = (I32, a[1] > b[1], 0.0)
+                res = (I32, int2int64(a[1]) > int2int64(b[1]), 0.0)
             elif 0x56 == opcode: # i64.gt_u
                 if VALIDATE: assert a[0] == I64 and b[0] == I64
-                res = (I32, a[1] > b[1], 0.0)
+                res = (I32, int2uint64(a[1]) > int2uint64(b[1]), 0.0)
             elif 0x57 == opcode: # i64.le_s
                 if VALIDATE: assert a[0] == I64 and b[0] == I64
-                res = (I32, a[1] <= b[1], 0.0)
+                res = (I32, int2int64(a[1]) <= int2int64(b[1]), 0.0)
             elif 0x58 == opcode: # i64.le_u
                 if VALIDATE: assert a[0] == I64 and b[0] == I64
-                res = (I32, a[1] <= b[1], 0.0)
+                res = (I32, int2uint64(a[1]) <= int2uint64(b[1]), 0.0)
+            elif 0x59 == opcode: # i64.ge_s
+                if VALIDATE: assert a[0] == I64 and b[0] == I64
+                res = (I32, int2int64(a[1]) >= int2int64(b[1]), 0.0)
+            elif 0x5a == opcode: # i64.ge_u
+                if VALIDATE: assert a[0] == I64 and b[0] == I64
+                res = (I32, int2uint64(a[1]) >= int2uint64(b[1]), 0.0)
             elif 0x5b == opcode: # f32.eq
                 if VALIDATE: assert a[0] == F32 and b[0] == F32
                 res = (I32, a[2] == b[2], 0.0)
+            elif 0x5c == opcode: # f32.ne
+                if VALIDATE: assert a[0] == F32 and b[0] == F32
+                res = (I32, a[2] != b[2], 0.0)
             elif 0x5d == opcode: # f32.lt
                 if VALIDATE: assert a[0] == F32 and b[0] == F32
                 res = (I32, a[2] < b[2], 0.0)
             elif 0x5e == opcode: # f32.gt
                 if VALIDATE: assert a[0] == F32 and b[0] == F32
                 res = (I32, a[2] > b[2], 0.0)
+            elif 0x5f == opcode: # f32.le
+                if VALIDATE: assert a[0] == F32 and b[0] == F32
+                res = (I32, a[2] <= b[2], 0.0)
+            elif 0x60 == opcode: # f32.ge
+                if VALIDATE: assert a[0] == F32 and b[0] == F32
+                res = (I32, a[2] >= b[2], 0.0)
             elif 0x61 == opcode: # f64.eq
                 if VALIDATE: assert a[0] == F64 and b[0] == F64
                 res = (I32, a[2] == b[2], 0.0)
             elif 0x62 == opcode: # f64.ne
                 if VALIDATE: assert a[0] == F64 and b[0] == F64
                 res = (I32, a[2] != b[2], 0.0)
+            elif 0x63 == opcode: # f64.lt
+                if VALIDATE: assert a[0] == F64 and b[0] == F64
+                res = (I32, a[2] < b[2], 0.0)
+            elif 0x64 == opcode: # f64.gt
+                if VALIDATE: assert a[0] == F64 and b[0] == F64
+                res = (I32, a[2] > b[2], 0.0)
+            elif 0x65 == opcode: # f64.le
+                if VALIDATE: assert a[0] == F64 and b[0] == F64
+                res = (I32, a[2] <= b[2], 0.0)
+            elif 0x66 == opcode: # f64.ge
+                if VALIDATE: assert a[0] == F64 and b[0] == F64
+                res = (I32, a[2] >= b[2], 0.0)
             else:
-                raise Exception("%s(0x%x) unimplemented" % (
+                raise WAException("%s(0x%x) unimplemented" % (
                     OPERATOR_INFO[opcode][0], opcode))
             if TRACE:
                 debug("      - (%s, %s) = %s" % (
@@ -1306,7 +1506,7 @@ def interpret_mvp(module,
             sp += 1
             stack[sp] = res
 
-        # 
+        #
         # Numeric operators
         #
 
@@ -1315,26 +1515,65 @@ def interpret_mvp(module,
                         0x8c, 0x99, 0x9a]:
             a = stack[sp]
             sp -= 1
-            if 0x68 == opcode: # i32.ctz
+            if   0x67 == opcode: # i32.clz
                 if VALIDATE: assert a[0] == I32
                 count = 0
                 val = a[1]
-                while (val % 2) == 0:
+                while count < 32 and (val & 0x80000000) == 0:
+                    count += 1
+                    val = val * 2
+                res = (I32, count, 0.0)
+            elif 0x68 == opcode: # i32.ctz
+                if VALIDATE: assert a[0] == I32
+                count = 0
+                val = a[1]
+                while count < 32 and (val % 2) == 0:
                     count += 1
                     val = val / 2
                 res = (I32, count, 0.0)
-            elif 0x7b == opcode: # f32.abs
-                if VALIDATE: assert a[0] == F32
-                res = (F32, 0, abs(a[2]))
-            elif  0x7c == opcode: # f32.neg
-                if VALIDATE: assert a[0] == F32
-                res = (F32, 0, -a[2])
+            elif 0x69 == opcode: # i32.popcnt
+                if VALIDATE: assert a[0] == I32
+                count = 0
+                val = a[1]
+                for i in range(32):
+                    if 0x1 & val:
+                        count += 1
+                    val = val / 2
+                res = (I32, count, 0.0)
+            elif 0x79 == opcode: # i64.clz
+                if VALIDATE: assert a[0] == I64
+                val = a[1]
+                if val < 0:
+                    res = (I64, 0, 0.0)
+                else:
+                    count = 1
+                    while count < 63 and (val & 0x4000000000000000) == 0:
+                        count += 1
+                        val = val * 2
+                    res = (I64, count, 0.0)
+            elif 0x7a == opcode: # i64.ctz
+                if VALIDATE: assert a[0] == I64
+                count = 0
+                val = a[1]
+                while count < 64 and (val % 2) == 0:
+                    count += 1
+                    val = val / 2
+                res = (I64, count, 0.0)
+            elif 0x7b == opcode: # i64.popcnt
+                if VALIDATE: assert a[0] == I64
+                count = 0
+                val = a[1]
+                for i in range(64):
+                    if 0x1 & val:
+                        count += 1
+                    val = val / 2
+                res = (I64, count, 0.0)
             elif 0x8b == opcode: # f32.abs
                 if VALIDATE: assert a[0] == F32
-                res = (F64, 0, abs(a[2]))
-            elif  0x8c == opcode: # f32.neg
+                res = (F32, 0, abs(a[2]))
+            elif 0x8c == opcode: # f32.neg
                 if VALIDATE: assert a[0] == F32
-                res = (F64, 0, -a[2])
+                res = (F32, 0, -a[2])
             elif 0x99 == opcode: # f64.abs
                 if VALIDATE: assert a[0] == F64
                 res = (F64, 0, abs(a[2]))
@@ -1342,7 +1581,7 @@ def interpret_mvp(module,
                 if VALIDATE: assert a[0] == F64
                 res = (F64, 0, -a[2])
             else:
-                raise Exception("%s(0x%x) unimplemented" % (
+                raise WAException("%s(0x%x) unimplemented" % (
                     OPERATOR_INFO[opcode][0], opcode))
             if TRACE:
                 debug("      - (%s) = %s" % (
@@ -1352,19 +1591,55 @@ def interpret_mvp(module,
 
         # i32 binary
         elif 0x6a <= opcode <= 0x78:
-            b, a = stack[sp], stack[sp-1]
+            a, b = stack[sp-1], stack[sp]
             sp -= 2
             if VALIDATE: assert a[0] == I32 and b[0] == I32
             if   0x6a == opcode: # i32.add
-                res = (I32, a[1] + b[1], 0.0)
+                res = (I32, int2int32(a[1] + b[1]), 0.0)
             elif 0x6b == opcode: # i32.sub
                 res = (I32, a[1] - b[1], 0.0)
             elif 0x6c == opcode: # i32.mul
-                res = (I32, a[1] * b[1], 0.0)
+                res = (I32, int2int32(a[1] * b[1]), 0.0)
+            elif 0x6d == opcode: # i32.div_s
+                if b[1] == 0:
+                    raise WAException("integer divide by zero")
+                elif a[1] == 0x80000000 and b[1] == -1:
+                    raise WAException("integer overflow")
+                else:
+                    res = (I32, idiv_s(int2int32(a[1]), int2int32(b[1])), 0.0)
+            elif 0x6e == opcode: # i32.div_u
+                if b[1] == 0:
+                    raise WAException("integer divide by zero")
+                else:
+                    res = (I32, int2uint32(a[1]) / int2uint32(b[1]), 0.0)
+            elif 0x6f == opcode: # i32.rem_s
+                if b[1] == 0:
+                    raise WAException("integer divide by zero")
+                else:
+                    res = (I32, irem_s(int2int32(a[1]), int2int32(b[1])), 0.0)
+            elif 0x70 == opcode: # i32.rem_u
+                if b[1] == 0:
+                    raise WAException("integer divide by zero")
+                else:
+                    res = (I32, int2uint32(a[1]) % int2uint32(b[1]), 0.0)
             elif 0x71 == opcode: # i32.and
                 res = (I32, a[1] & b[1], 0.0)
+            elif 0x72 == opcode: # i32.or
+                res = (I32, a[1] | b[1], 0.0)
+            elif 0x73 == opcode: # i32.xor
+                res = (I32, a[1] ^ b[1], 0.0)
+            elif 0x74 == opcode: # i32.shl
+                res = (I32, a[1] << (b[1] % 0x20), 0.0)
+            elif 0x75 == opcode: # i32.shr_s
+                res = (I32, int2int32(a[1]) >> (b[1] % 0x20), 0.0)
+            elif 0x76 == opcode: # i32.shr_u
+                res = (I32, int2uint32(a[1]) >> (b[1] % 0x20), 0.0)
+#            elif 0x77 == opcode: # i32.rotl
+#                res = (I32, rotl32(a[1], b[1]), 0.0)
+#            elif 0x78 == opcode: # i32.rotr
+#                res = (I32, rotr32(a[1], b[1]), 0.0)
             else:
-                raise Exception("%s(0x%x) unimplemented" % (
+                raise WAException("%s(0x%x) unimplemented" % (
                     OPERATOR_INFO[opcode][0], opcode))
             if TRACE:
                 debug("      - (%s, %s) = %s" % (
@@ -1376,18 +1651,58 @@ def interpret_mvp(module,
         elif 0x7c <= opcode <= 0x8a:
             a, b = stack[sp-1], stack[sp]
             sp -= 2
-            debug("a[0]: %s, b[0]: %s" % (a[0], b[0]))
             if VALIDATE: assert a[0] == I64 and b[0] == I64
             if   0x7c == opcode: # i64.add
-                res = (I64, a[1] + b[1], 0.0)
+                res = (I64, int2int64(a[1] + b[1]), 0.0)
             elif 0x7d == opcode: # i64.sub
                 res = (I64, a[1] - b[1], 0.0)
             elif 0x7e == opcode: # i64.mul
-                res = (I64, sys.maxint & (a[1] * b[1]), 0.0)
+                res = (I64, int2int64(a[1] * b[1]), 0.0)
             elif 0x7f == opcode: # i64.div_s
-                res = (I64, a[1] / b[1], 0.0)
+                if b[1] == 0:
+                    raise WAException("integer divide by zero")
+#                elif a[1] == 0x8000000000000000 and b[1] == -1:
+#                    raise WAException("integer overflow")
+                else:
+                    res = (I64, idiv_s(int2int64(a[1]), int2int64(b[1])), 0.0)
+            elif 0x80 == opcode: # i64.div_u
+                if b[1] == 0:
+                    raise WAException("integer divide by zero")
+                else:
+                    if a[1] < 0 and b[1] > 0:
+                        res = (I64, int2uint64(-a[1]) / int2uint64(b[1]), 0.0)
+                    elif a[1] > 0 and b[1] < 0:
+                        res = (I64, int2uint64(a[1]) / int2uint64(-b[1]), 0.0)
+                    else:
+                        res = (I64, int2uint64(a[1]) / int2uint64(b[1]), 0.0)
+            elif 0x81 == opcode: # i64.rem_s
+                if b[1] == 0:
+                    raise WAException("integer divide by zero")
+                else:
+                    res = (I64, irem_s(int2int64(a[1]), int2int64(b[1])), 0.0)
+            elif 0x82 == opcode: # i64.rem_u
+                if b[1] == 0:
+                    raise WAException("integer divide by zero")
+                else:
+                    res = (I64, int2uint64(a[1]) % int2uint64(b[1]), 0.0)
+            elif 0x83 == opcode: # i64.and
+                res = (I64, a[1] & b[1], 0.0)
+            elif 0x84 == opcode: # i64.or
+                res = (I64, a[1] | b[1], 0.0)
+            elif 0x85 == opcode: # i64.xor
+                res = (I64, a[1] ^ b[1], 0.0)
+            elif 0x86 == opcode: # i64.shl
+                res = (I64, a[1] << (b[1] % 0x40), 0.0)
+            elif 0x87 == opcode: # i64.shr_s
+                res = (I64, int2int64(a[1]) >> (b[1] % 0x40), 0.0)
+            elif 0x88 == opcode: # i64.shr_u
+                res = (I64, int2uint64(a[1]) >> (b[1] % 0x40), 0.0)
+#            elif 0x89 == opcode: # i64.rotl
+#                res = (I64, rotl64(a[1], b[1]), 0.0)
+#            elif 0x8a == opcode: # i64.rotr
+#                res = (I64, rotr64(a[1], b[1]), 0.0)
             else:
-                raise Exception("%s(0x%x) unimplemented" % (
+                raise WAException("%s(0x%x) unimplemented" % (
                     OPERATOR_INFO[opcode][0], opcode))
             if TRACE:
                 debug("      - (%s, %s) = %s" % (
@@ -1396,8 +1711,8 @@ def interpret_mvp(module,
             stack[sp] = res
 
         # f32 binary operations
-        elif 0x92 <= opcode <= 0x97:
-            b, a = stack[sp], stack[sp-1]
+        elif 0x92 <= opcode <= 0x98:
+            a, b = stack[sp-1], stack[sp]
             sp -= 2
             if VALIDATE: assert a[0] == F32 and b[0] == F32
             if   0x92 == opcode: # f32.add
@@ -1408,8 +1723,23 @@ def interpret_mvp(module,
                 res = (F32, 0, a[2] * b[2])
             elif 0x95 == opcode: # f32.div
                 res = (F32, 0, a[2] / b[2])
+            elif 0x96 == opcode: # f32.min
+                if a[2] < b[2]:
+                    res = (F32, 0, a[2])
+                else:
+                    res = (F32, 0, b[2])
+            elif 0x97 == opcode: # f32.max
+                if a[2] > b[2]:
+                    res = (F32, 0, a[2])
+                else:
+                    res = (F32, 0, b[2])
+            elif 0x98 == opcode: # f32.copysign
+                if b[2] > 0:
+                    res = (F32, 0, abs(a[2]))
+                else:
+                    res = (F32, 0, -abs(a[2]))
             else:
-                raise Exception("%s(0x%x) unimplemented" % (
+                raise WAException("%s(0x%x) unimplemented" % (
                     OPERATOR_INFO[opcode][0], opcode))
             if TRACE:
                 debug("      - (%s, %s) = %s" % (
@@ -1419,15 +1749,34 @@ def interpret_mvp(module,
 
         # f64 binary operations
         elif 0xa0 <= opcode <= 0xa6:
-            b, a = stack[sp], stack[sp-1]
+            a, b = stack[sp-1], stack[sp]
             sp -= 2
             if VALIDATE: assert a[0] == F64 and b[0] == F64
             if   0xa0 == opcode: # f64.add
                 res = (F64, 0, a[2] + b[2])
             elif 0xa1 == opcode: # f64.sub
                 res = (F64, 0, a[2] - b[2])
+            elif 0xa2 == opcode: # f64.mul
+                res = (F64, 0, a[2] * b[2])
+            elif 0xa3 == opcode: # f64.div
+                res = (F64, 0, a[2] / b[2])
+            elif 0xa4 == opcode: # f64.min
+                if a[2] < b[2]:
+                    res = (F64, 0, a[2])
+                else:
+                    res = (F64, 0, b[2])
+            elif 0xa5 == opcode: # f64.max
+                if a[2] > b[2]:
+                    res = (F64, 0, a[2])
+                else:
+                    res = (F64, 0, b[2])
+            elif 0xa6 == opcode: # f64.copysign
+                if b[2] > 0:
+                    res = (F64, 0, abs(a[2]))
+                else:
+                    res = (F64, 0, -abs(a[2]))
             else:
-                raise Exception("%s(0x%x) unimplemented" % (
+                raise WAException("%s(0x%x) unimplemented" % (
                     OPERATOR_INFO[opcode][0], opcode))
             if TRACE:
                 debug("      - (%s, %s) = %s" % (
@@ -1443,33 +1792,118 @@ def interpret_mvp(module,
             # conversion operations
             if   0xa7 == opcode: # i32.wrap/i64
                 if VALIDATE: assert a[0] == I64
-                res = (I32, a[1], 0.0)
-            elif 0xb0 == opcode: # i64.trunc_s/f64
-                if VALIDATE: assert a[0] == F64
-                res = (I64, int(a[2]), 0.0)
-            elif 0xa6 == opcode: # i64.extend_s/i32
+                res = (I32, int2int32(a[1]), 0.0)
+            elif 0xa8 == opcode: # i32.trunc_s/f32
+                if VALIDATE: assert a[0] == F32
+                if math.isnan(a[2]):
+                    raise WAException("invalid conversion to integer")
+                elif a[2] > 2147483647.0:
+                    raise WAException("integer overflow")
+                elif a[2] < -2147483648.0:
+                    raise WAException("integer overflow")
+                res = (I32, int(a[2]), 0.0)
+#            elif 0xa9 == opcode: # i32.trunc_u/f32
+#                if VALIDATE: assert a[0] == F32
+#                if math.isnan(a[2]):
+#                    raise WAException("invalid conversion to integer")
+#                elif a[2] > 4294967295.0:
+#                    raise WAException("integer overflow")
+#                elif a[2] <= -1.0:
+#                    raise WAException("integer overflow")
+#                res = (I32, int(a[2]), 0.0)
+#            elif 0xaa == opcode: # i32.trunc_s/f64
+#                if VALIDATE: assert a[0] == F64
+#                if math.isnan(a[2]):
+#                    raise WAException("invalid conversion to integer")
+#                elif a[2] > 2**31-1:
+#                    raise WAException("integer overflow")
+#                elif a[2] < -2**31:
+#                    raise WAException("integer overflow")
+#                res = (I32, int(a[2]), 0.0)
+#            elif 0xab == opcode: # i32.trunc_u/f64
+#                if VALIDATE: assert a[0] == F64
+#                debug("*** a[2]: %s" % a[2])
+#                if math.isnan(a[2]):
+#                    raise WAException("invalid conversion to integer")
+#                elif a[2] > 2**32-1:
+#                    raise WAException("integer overflow")
+#                elif a[2] <= -1.0:
+#                    raise WAException("integer overflow")
+#                res = (I32, int(a[2]), 0.0)
+            elif 0xac == opcode: # i64.extend_s/i32
                 if VALIDATE: assert a[0] == I32
-                res = (I64, a[1], 0.0)
+                res = (I64, int2int32(a[1]), 0.0)
             elif 0xad == opcode: # i64.extend_u/i32
                 if VALIDATE: assert a[0] == I32
-                res = (I64, a[1], 0.0)
+                res = (I64, intmask(a[1]), 0.0)
+#            elif 0xae == opcode: # i64.trunc_s/f32
+#                if VALIDATE: assert a[0] == F32
+#                if math.isnan(a[2]):
+#                    raise WAException("invalid conversion to integer")
+#                elif a[2] > 2**63-1:
+#                    raise WAException("integer overflow")
+#                elif a[2] < -2**63:
+#                    raise WAException("integer overflow")
+#                res = (I64, int(a[2]), 0.0)
+#            elif 0xaf == opcode: # i64.trunc_u/f32
+#                if VALIDATE: assert a[0] == F32
+#                if math.isnan(a[2]):
+#                    raise WAException("invalid conversion to integer")
+#                elif a[2] > 2**63-1:
+#                    raise WAException("integer overflow")
+#                elif a[2] <= -1.0:
+#                    raise WAException("integer overflow")
+#                res = (I64, int(a[2]), 0.0)
+            elif 0xb0 == opcode: # i64.trunc_s/f64
+                if VALIDATE: assert a[0] == F64
+                if math.isnan(a[2]):
+                    raise WAException("invalid conversion to integer")
+#                elif a[2] > 2**63-1:
+#                    raise WAException("integer overflow")
+#                elif a[2] < -2**63:
+#                    raise WAException("integer overflow")
+                res = (I64, int(a[2]), 0.0)
+            elif 0xb1 == opcode: # i64.trunc_u/f64
+                if VALIDATE: assert a[0] == F64
+                if math.isnan(a[2]):
+                    raise WAException("invalid conversion to integer")
+#                elif a[2] > 2**63-1:
+#                    raise WAException("integer overflow")
+                elif a[2] <= -1.0:
+                    raise WAException("integer overflow")
+                res = (I64, int(a[2]), 0.0)
+            elif 0xb2 == opcode: # f32.convert_s/i32
+                if VALIDATE: assert a[0] == I32
+                res = (F32, 0, float(a[1]))
+            elif 0xb3 == opcode: # f32.convert_u/i32
+                if VALIDATE: assert a[0] == I32
+                res = (F32, 0, float(int2uint32(a[1])))
+            elif 0xb4 == opcode: # f32.convert_s/i64
+                if VALIDATE: assert a[0] == I64
+                res = (F32, 0, float(a[1]))
+            elif 0xb5 == opcode: # f32.convert_u/i64
+                if VALIDATE: assert a[0] == I64
+                res = (F32, 0, float(int2uint64(a[1])))
+#            elif 0xb6 == opcode: # f32.demote/f64
+#                if VALIDATE: assert a[0] == F64
+#                res = (F32, 0, unpack_f32(pack_f32(a[2])))
             elif 0xb7 == opcode: # f64.convert_s/i32
                 if VALIDATE: assert a[0] == I32
                 res = (F64, 0, float(a[1]))
             elif 0xb8 == opcode: # f64.convert_u/i32
                 if VALIDATE: assert a[0] == I32
-                res = (F64, 0, float(a[1]))
+                res = (F64, 0, float(int2uint32(a[1])))
             elif 0xb9 == opcode: # f64.convert_s/i64
                 if VALIDATE: assert a[0] == I64
                 res = (F64, 0, float(a[1]))
             elif 0xba == opcode: # f64.convert_u/i64
                 if VALIDATE: assert a[0] == I64
-                res = (F64, 0, float(a[1]))
+                res = (F64, 0, float(int2uint64(a[1])))
             elif 0xbb == opcode: # f64.promote/f32
                 if VALIDATE: assert a[0] == F32
                 res = (F64, 0, a[2])
             else:
-                raise Exception("%s(0x%x) unimplemented" % (
+                raise WAException("%s(0x%x) unimplemented" % (
                     OPERATOR_INFO[opcode][0], opcode))
             if TRACE:
                 debug("      - (%s) = %s" % (
@@ -1482,12 +1916,20 @@ def interpret_mvp(module,
             a = stack[sp]
             sp -= 1
 
-            # conversion operations
-            if   0xbf == opcode: # f64.reinterpret/i64
+            if   0xbc == opcode: # i32.reinterpret/f32
+                if VALIDATE: assert a[0] == F32
+                res = (I32, intmask(pack_f32(a[2])), 0.0)
+            elif 0xbd == opcode: # i64.reinterpret/f64
+                if VALIDATE: assert a[0] == F64
+                res = (I64, intmask(pack_f64(a[2])), 0.0)
+#            elif 0xbe == opcode: # f32.reinterpret/i32
+#                if VALIDATE: assert a[0] == I32
+#                res = (F32, 0, unpack_f32(int2int32(a[1])))
+            elif 0xbf == opcode: # f64.reinterpret/i64
                 if VALIDATE: assert a[0] == I64
-                res = (F64, 0, unpack_f64(a[2]))
+                res = (F64, 0, unpack_f64(int2int64(a[1])))
             else:
-                raise Exception("%s(0x%x) unimplemented" % (
+                raise WAException("%s(0x%x) unimplemented" % (
                     OPERATOR_INFO[opcode][0], opcode))
             if TRACE:
                 debug("      - (%s) = %s" % (
@@ -1496,7 +1938,7 @@ def interpret_mvp(module,
             stack[sp] = res
 
         else:
-            raise Exception("unrecognized opcode %d" % opcode)
+            raise WAException("unrecognized opcode 0x%x" % opcode)
 
     return pc, sp
 
@@ -1592,6 +2034,7 @@ class Module():
         self.export_list = []
         self.export_map = {}
         self.memory = Memory(1)  # default to 1 page
+        self.global_list = []
 
         # block/loop/if blocks {start addr: Block, ...}
         self.block_map = {}
@@ -1600,9 +2043,9 @@ class Module():
         self.sp = -1
         self.fp = -1
         self.stack = [(0x00, 0, 0.0)] * STACK_SIZE
-        self.bsp = -1
+        self.csp = -1
         block = Block(0x00, BLOCK_TYPE[I32], 0)
-        self.blockstack = [(block, -1, -1, 0)] * BLOCKSTACK_SIZE
+        self.callstack = [(block, -1, -1, 0)] * CALLSTACK_SIZE
         self.start_function = -1
 
         self.read_magic()
@@ -1616,11 +2059,11 @@ class Module():
             fidx = self.start_function
             info("Running start function 0x%x" % fidx)
             if TRACE:
-                dump_stacks(self.sp, self.stack, self.fp, self.bsp,
-                        self.blockstack)
-            self.rdr.pos, self.sp, self.fp, self.bsp = do_call(
-                    self.stack, self.blockstack, self.sp, self.fp,
-                    self.bsp, self.function[fidx], len(self.rdr.bytes))
+                dump_stacks(self.sp, self.stack, self.fp, self.csp,
+                        self.callstack)
+            self.rdr.pos, self.sp, self.fp, self.csp = do_call(
+                    self.stack, self.callstack, self.sp, self.fp,
+                    self.csp, self.function[fidx], len(self.rdr.bytes))
             self.interpret()
 
     def dump(self):
@@ -1662,9 +2105,14 @@ class Module():
             return '0' * (cnt-len(s)) + s
 
         info("Memory:")
-        for r in range(10):
-            info("  0x%s [%s]" % (hexpad(r*16,3),
-                ",".join([hexpad(b,2) for b in self.memory.bytes[r*16:r*16+16]])))
+        if self.memory.pages > 0:
+            for r in range(10):
+                info("  0x%s [%s]" % (hexpad(r*16,3),
+                    ",".join([hexpad(b,2) for b in self.memory.bytes[r*16:r*16+16]])))
+
+        info("Global:")
+        for i, g in enumerate(self.global_list):
+            info("  0x%s [%s]" % (i, value_repr(g)))
 
         info("Exports:")
         for i, e in enumerate(self.export_list):
@@ -1750,9 +2198,9 @@ class Module():
             kind = self.rdr.read_byte()
 
             if kind == 0x0:  # Function
-                sig_index = self.rdr.read_LEB(32)
-                type = self.type[sig_index]
-                imp = Import(module, field, kind, type=sig_index)
+                type_index = self.rdr.read_LEB(32)
+                type = self.type[type_index]
+                imp = Import(module, field, kind, type=type_index)
                 self.import_list.append(imp)
                 func = FunctionImport(type, module, field)
                 self.function.append(func)
@@ -1808,7 +2256,22 @@ class Module():
         self.memory = Memory(initial)
 
     def parse_Global(self, length):
-        return self.rdr.read_bytes(length)
+        count = self.rdr.read_LEB(32)
+        for c in range(count):
+            content_type = self.rdr.read_LEB(7)
+            mutable = self.rdr.read_LEB(1)
+            # Run the init_expr
+            block = Block(0x00, BLOCK_TYPE[content_type], self.rdr.pos)
+            self.csp += 1
+            self.callstack[self.csp] = (block, self.sp, self.fp, 0)
+            # WARNING: running code here to get offset!
+            self.interpret()  # run iter_expr
+            _, _, self.sp, self.fp, self.csp = pop_block(
+                    self.stack, self.callstack, self.sp, self.fp, self.csp)
+            init_val = self.stack[self.sp]
+            self.sp -= 1
+            assert content_type == init_val[0]
+            self.global_list.append(init_val)
 
     def parse_Export(self, length):
         count = self.rdr.read_LEB(32)
@@ -1837,8 +2300,8 @@ class Module():
 
             # Run the init_expr
             block = Block(0x00, BLOCK_TYPE[I32], self.rdr.pos)
-            self.bsp += 1
-            self.blockstack[self.bsp] = (block, self.sp, self.fp, 0)
+            self.csp += 1
+            self.callstack[self.csp] = (block, self.sp, self.fp, 0)
             # WARNING: running code here to get offset!
             self.interpret()  # run iter_expr
             offset_val = self.stack[self.sp]
@@ -1892,8 +2355,8 @@ class Module():
 
             # Run the init_expr
             block = Block(0x00, BLOCK_TYPE[I32], self.rdr.pos)
-            self.bsp += 1
-            self.blockstack[self.bsp] = (block, self.sp, self.fp, 0)
+            self.csp += 1
+            self.callstack[self.csp] = (block, self.sp, self.fp, 0)
             # WARNING: running code here to get offset!
             self.interpret()  # run iter_expr
             offset_val = self.stack[self.sp]
@@ -1911,15 +2374,15 @@ class Module():
                 self.rdr.pos, self.rdr.bytes, self.function,
                 self.table, self.block_map,
                 # Reds
-                self.memory, self.sp, self.stack, self.fp, self.bsp,
-                self.blockstack)
+                self.memory, self.sp, self.stack, self.fp, self.csp,
+                self.callstack)
 
 
     def run(self, name, args):
         # Reset stacks
         self.sp  = -1
         self.fp  = -1
-        self.bsp = -1
+        self.csp = -1
 
         fidx = self.export_map[name].index
 
@@ -1928,32 +2391,21 @@ class Module():
         for idx, arg in enumerate(args):
             arg = args[idx].lower()
             assert isinstance(arg, str)
-            tname = VALUE_TYPE[tparams[idx]]
-            if   tname == "i32": val = (I32, int(arg), 0.0)
-            elif tname == "i64": val = (I64, int(arg), 0.0)
-            elif tname == "f32":
-                if arg == 'nan': val = (F32, 0, NAN)
-                else:            val = (F32, 0, float(arg))
-            elif tname == "f64":
-                if arg == 'nan': val = (F64, 0, NAN)
-                else:            val = (F64, 0, float(arg))
-            else: raise Exception("invalid argument %d: %s" % (
-                idx, arg))
             self.sp += 1
-            self.stack[self.sp] = val
+            self.stack[self.sp] = parse_number(tparams[idx], arg)
 
         info("Running function '%s' (0x%x)" % (name, fidx))
         if TRACE:
-            dump_stacks(self.sp, self.stack, self.fp, self.bsp,
-                    self.blockstack)
-        self.rdr.pos, self.sp, self.fp, self.bsp = do_call(
-                self.stack, self.blockstack, self.sp, self.fp,
-                self.bsp, self.function[fidx], len(self.rdr.bytes))
+            dump_stacks(self.sp, self.stack, self.fp, self.csp,
+                    self.callstack)
+        self.rdr.pos, self.sp, self.fp, self.csp = do_call(
+                self.stack, self.callstack, self.sp, self.fp,
+                self.csp, self.function[fidx], len(self.rdr.bytes))
 
         self.interpret()
         if TRACE:
-            dump_stacks(self.sp, self.stack, self.fp, self.bsp,
-                    self.blockstack)
+            dump_stacks(self.sp, self.stack, self.fp, self.csp,
+                    self.callstack)
         if self.sp >= 0:
             ret = self.stack[self.sp]
             self.sp -= 1
@@ -2097,6 +2549,6 @@ def target(*args):
     return entry_point
 
 # Just run entry_point if not RPython compilation
-if not IS_RPYTHON:
+if not IS_RPYTHON and __name__ == '__main__':
     sys.exit(entry_point(sys.argv))
 
