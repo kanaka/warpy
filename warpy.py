@@ -1,5 +1,13 @@
 #!/usr/bin/env python
 
+#INFO  = False   # informational logging
+#TRACE = False   # trace instructions/stacks
+#DEBUG = False   # verbose logging
+INFO  = True    # informational logging
+TRACE = False   # trace instructions/stacks
+DEBUG = True    # verbose logging
+VALIDATE= True
+
 import sys, os, math
 IS_RPYTHON = sys.argv[0].endswith('rpython')
 
@@ -72,13 +80,6 @@ else:
 
     def fround(val, digits):
         return round(val, digits)
-
-INFO  = True   # informational logging
-#DEBUG = False  # verbose logging
-DEBUG = True   # verbose logging
-TRACE = False  # trace instructions/stacks
-#TRACE = True   # trace instructions/stacks
-VALIDATE= True
 
 
 ######################################
@@ -436,7 +437,16 @@ LOAD_SIZE = { 0x28 : 4,
               0x32 : 2,
               0x33 : 2,
               0x34 : 4,
-              0x35 : 4 }
+              0x35 : 4,
+              0x36 : 4,
+              0x37 : 8,
+              0x38 : 4,
+              0x39 : 8,
+              0x40 : 1,
+              0x41 : 2,
+              0x42 : 1,
+              0x43 : 2,
+              0x44 : 4 }
 
 
 ######################################
@@ -736,7 +746,7 @@ def func_repr(f):
 
 def block_repr(block):
     if isinstance(block, Block):
-        return "%s<0->%d>" % (
+        return "%s<0/0->%d>" % (
                 BLOCK_NAMES[block.kind],
                 len(block.type.results))
     elif isinstance(block, Function):
@@ -753,7 +763,7 @@ def stack_repr(sp, fp, stack):
     return "[" + " ".join(res) + "]"
 
 def callstack_repr(csp, bs):
-    return "[" + " ".join(["%s(sp:0x%x/fp:0x%x/ra:0x%x)" % (
+    return "[" + " ".join(["%s(sp:%d/fp:%d/ra:0x%x)" % (
         block_repr(bs[i][0]),bs[i][1],bs[i][2],bs[i][3])
                            for i in range(csp+1)]) + "]"
 
@@ -828,8 +838,6 @@ def skip_immediates(code, pos):
 def find_blocks(code, start, end, block_map):
     pos = start
 
-    # map of blocks: {start : (type, end), ...}
-    block_end_map = {}
     # stack of blocks with current at top: (opcode, pos) tuples
     opstack = []
 
@@ -856,14 +864,12 @@ def find_blocks(code, start, end, block_map):
                 block.update(pos, block.start+2)
             else:  # block/if: label at end
                 block.update(pos, pos)
-            block_end_map[pos] = True
         pos, _ = skip_immediates(code, pos)
 
-    assert opcode == 0xb, "function block did not end with 0xf"
+    assert opcode == 0xb, "function block did not end with 0xb"
+    assert len(opstack) == 0, "function ended in middle of block"
 
     #debug("block_map: %s" % block_map)
-    #debug("block_end_map: %s" % block_end_map)
-
     return block_map
 
 @unroll_safe
@@ -918,16 +924,18 @@ def do_call(stack, callstack, sp, fp, csp, func, pc):
             func.index, func.start, func.end,
             len(func.locals), len(t.params), len(t.results)))
 
-    # push locals (dropping extras)
+    # set frame pointer to include parameters
     fp = sp - len(t.params) + 1
-    for tidx in range(len(t.params)):
-        val = stack[fp+tidx]
-        if VALIDATE:
+    # validate parameters
+    if VALIDATE:
+        for tidx in range(len(t.params)):
+            val = stack[fp+tidx]
             ptype = t.params[tidx]
             if ptype != val[0]:
                 raise WAException("call signature mismatch: %s != %s" % (
                     VALUE_TYPE[ptype], VALUE_TYPE[val[0]]))
 
+    # push locals (dropping extras)
     for lidx in range(len(func.locals)):
         ltype = func.locals[lidx]
         sp += 1
@@ -1090,14 +1098,14 @@ def interpret_mvp(module,
                 pc = ra
                 if csp == -1:
                     # Return to top-level, ignoring return_addr
-                    return pc, sp
+                    return pc, sp, fp, csp
                 else:
                     if TRACE:
                         info("  Returning from function 0x%x to 0x%x" % (
                             block.index, pc))
             elif isinstance(block, Block) and block.kind == 0x00:
                 # this is an init_expr
-                return pc, sp
+                return pc, sp, fp, csp
             else:
                 pass # end of block/loop/if, keep going
         elif 0x0c == opcode:  # br
@@ -1151,7 +1159,7 @@ def interpret_mvp(module,
             # The actual pop_block and return is handled by handling
             # the end opcode
             pc = block.end
-            if TRACE: debug("      - to 0x%x" % block.br_addr)
+            if TRACE: debug("      - to 0x%x" % pc)
 
         #
         # Call operators
@@ -1307,6 +1315,8 @@ def interpret_mvp(module,
                              flags, offset, addr_val[1], val[1]))
             addr = addr_val[1] + offset
             assert addr >= 0
+            if bound_violation(opcode, addr, memory.pages):
+                raise WAException("out of bounds memory access")
             if   0x36 == opcode:  # i32.store
                 write_I32(memory.bytes, addr, val[1])
             elif 0x37 == opcode:  # i64.store
@@ -1940,7 +1950,7 @@ def interpret_mvp(module,
         else:
             raise WAException("unrecognized opcode 0x%x" % opcode)
 
-    return pc, sp
+    return pc, sp, fp, csp
 
 
 ######################################
@@ -2143,10 +2153,12 @@ class Module():
                 VERSION, self.version))
 
     def read_section(self):
+        cur_pos = self.rdr.pos
         id = self.rdr.read_LEB(7)
         name = SECTION_NAMES[id]
         length = self.rdr.read_LEB(32)
-        debug("parsing %s(%d), length: %d bytes" % (name, id, length))
+        debug("parsing %s(%d), section start: 0x%x, payload start: 0x%x, length: 0x%x bytes" % (
+            name, id, cur_pos, self.rdr.pos, length))
         if   "Type" == name:     self.parse_Type(length)
         elif "Import" == name:   self.parse_Import(length)
         elif "Function" == name: self.parse_Function(length)
@@ -2218,8 +2230,11 @@ class Module():
             elif kind == 0x3:  # Global
                 type = self.rdr.read_byte()
                 mutability = self.rdr.read_LEB(1)
-                self.import_list.append(Import(module, field, kind,
-                    global_type=type, mutability=mutability))
+                if "%s.%s" % (module, field) == "spectest.global":
+                    self.global_list.append((type, 666, 666.6))
+                else:
+                    raise Exception("unsupported global import %s.%s" % (
+                        module, field))
 
     def parse_Function(self, length):
         count = self.rdr.read_LEB(32)
@@ -2230,19 +2245,20 @@ class Module():
 
     def parse_Table(self, length):
         count = self.rdr.read_LEB(32)
-        type = self.rdr.read_LEB(7)
-        assert type == ANYFUNC
+        assert count == 1
 
         initial = 1
         for c in range(count):
-            flags = self.rdr.read_LEB(32) # TODO: fix for MVP
+            type = self.rdr.read_LEB(7)
+            assert type == ANYFUNC
+            flags = self.rdr.read_LEB(1) # TODO: fix for MVP
             initial = self.rdr.read_LEB(32) # TODO: fix for MVP
             if flags & 0x1:
                 maximum = self.rdr.read_LEB(32)
             else:
                 maximum = initial
 
-        self.table[type] = [0] * initial
+            self.table[type] = [0] * initial
 
     def parse_Memory(self, length):
         count = self.rdr.read_LEB(32)
@@ -2257,9 +2273,12 @@ class Module():
 
     def parse_Global(self, length):
         count = self.rdr.read_LEB(32)
+        print("parse_Global count: %s" % count)
         for c in range(count):
             content_type = self.rdr.read_LEB(7)
             mutable = self.rdr.read_LEB(1)
+            print("global: content_type: %s, mutable: %s"
+                    % (content_type, mutable))
             # Run the init_expr
             block = Block(0x00, BLOCK_TYPE[content_type], self.rdr.pos)
             self.csp += 1
@@ -2269,6 +2288,7 @@ class Module():
             _, _, self.sp, self.fp, self.csp = pop_block(
                     self.stack, self.callstack, self.sp, self.fp, self.csp)
             init_val = self.stack[self.sp]
+            print("init_val: %s" % init_val)
             self.sp -= 1
             assert content_type == init_val[0]
             self.global_list.append(init_val)
@@ -2351,7 +2371,7 @@ class Module():
         seg_count = self.rdr.read_LEB(32)
         for seg in range(seg_count):
             index = self.rdr.read_LEB(32)
-            assert index == 0  # Only 1 default table in MVP
+            assert index == 0  # Only 1 default memory in MVP
 
             # Run the init_expr
             block = Block(0x00, BLOCK_TYPE[I32], self.rdr.pos)
@@ -2369,7 +2389,7 @@ class Module():
                 self.memory.bytes[addr] = self.rdr.read_byte()
 
     def interpret(self):
-        self.rdr.pos, self.sp = interpret_mvp(self,
+        self.rdr.pos, self.sp, self.fp, self.csp = interpret_mvp(self,
                 # Greens
                 self.rdr.pos, self.rdr.bytes, self.function,
                 self.table, self.block_map,
@@ -2378,11 +2398,14 @@ class Module():
                 self.callstack)
 
 
-    def run(self, name, args):
+    def run(self, all_args):
         # Reset stacks
         self.sp  = -1
         self.fp  = -1
         self.csp = -1
+
+        name = all_args[0]
+        args = all_args[1:]
 
         fidx = self.export_map[name].index
 
@@ -2400,7 +2423,7 @@ class Module():
                     self.callstack)
         self.rdr.pos, self.sp, self.fp, self.csp = do_call(
                 self.stack, self.callstack, self.sp, self.fp,
-                self.csp, self.function[fidx], len(self.rdr.bytes))
+                self.csp, self.function[fidx], 0)
 
         self.interpret()
         if TRACE:
@@ -2409,10 +2432,14 @@ class Module():
         if self.sp >= 0:
             ret = self.stack[self.sp]
             self.sp -= 1
-            return ret
+            info("%s(%s) = %s" % (
+                name, ",".join(args), value_repr(ret)))
+            print(value_repr(ret))
         else:
-            return (0x00, 0, 0.0)
-
+            info("%s(%s)" % (
+                name, ",".join(args)))
+            print("")
+        return 0
 
 ######################################
 # Imported functions points
@@ -2504,35 +2531,46 @@ def call_import(mem, module, field, args):
 def entry_point(argv):
     try:
         # Argument handling
-        wasm = open(argv[1]).read()
-
-        entry = "main"
-        if len(argv) >= 3:
-            entry = argv[2]
-
+        repl = False
         args = []
-        if len(argv) >= 4:
-            args = argv[3:]
+        for arg in argv[1:]:
+            if arg == "--repl":
+                repl = True
+            elif arg == "--":
+                continue
+            else:
+                args.append(arg)
+        wasm = open(args[0]).read()
+        args = args[1:]
 
         #
 
         m = Module(wasm, call_import, {})
 
-        # Args are strings at this point
-        res = m.run(entry, args)
-        if res[0] != 0x00:
-            info("%s(%s) = %s" % (
-                entry, ",".join(args), value_repr(res)))
-            print(value_repr(res))
+        if not repl:
+            # Invoke one function and exit
+            try:
+                return m.run(args)
+            except WAException as e:
+                if not IS_RPYTHON:
+                    os.write(2, "".join(traceback.format_exception(*sys.exc_info())))
+                os.write(2, "%s\n" % e.message)
+                return 1
         else:
-            info("%s(%s)" % (
-                entry, ",".join(args)))
+            # Simple REPL
+            while True:
+                try:
+                    line = readline("webassembly> ")
+                    if line == "": continue
 
-    except WAException as e:
-        if not IS_RPYTHON:
-            os.write(2, "".join(traceback.format_exception(*sys.exc_info())))
-        os.write(2, "%s\n" % e.message)
-        return 1
+                    res = m.run([l for l in line.split(' ') if l])
+                    if not res == 0:
+                        return res
+
+                except WAException as e:
+                    os.write(2, "Exception: %s\n" % e.message)
+                except EOFError as e:
+                    break
 
     except Exception as e:
         if IS_RPYTHON:
