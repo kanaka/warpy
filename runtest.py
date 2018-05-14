@@ -6,21 +6,22 @@ from subprocess import Popen, PIPE
 
 CLEANUP = False
 
-WAST2WASM = os.environ.get("WAST2WASM", "wast2wasm")
-WARPY = os.environ.get("WARPY", "./warpy.py")
-
 # regex patterns of tests to skip
-SKIP_TESTS = (
-              # names.wast
-              'invoke \"~!',
-              # conversions.wast
-              '18446742974197923840.0',
-              '18446744073709549568.0',
-              '9223372036854775808',
-              'reinterpret_f.*nan',
-              # endianness
-              '.const 0x1.fff'
-             )
+C_SKIP_TESTS = (
+        # names.wast
+        'invoke \"~!',
+        # conversions.wast
+        'reinterpret_f.*nan' )
+PY_SKIP_TESTS = (
+        # names.wast
+        'invoke \"~!',
+        # conversions.wast
+        '18446742974197923840.0',
+        '18446744073709549568.0',
+        '9223372036854775808',
+        'reinterpret_f.*nan',
+        # endianness
+        '.const 0x1.fff' )
 
 def read_forms(string):
     forms = []
@@ -135,7 +136,7 @@ def hexpad64(i):
     return "0x%016x" % i
 
 def invoke(wasm, func, args, returncode=0):
-    cmd = [WARPY, wasm, func] + args
+    cmd = [WA_CMD, wasm, func, "--"] + args
     #print("Running: %s" % " ".join(cmd))
 
     sp = Popen(cmd, stdout=PIPE, stderr=PIPE)
@@ -159,8 +160,12 @@ def test_assert(mode, wasm, func, args, expected, returncode=0):
         expects.add('%f:f32' % round(float(m0.group(1)),5))
     if expected == "-nan:f32":
         expects.add("nan:f32")
+    if expected == "nan:f32":
+        expects.add("-nan:f32")
     if expected == "-nan:f64":
         expects.add("nan:f64")
+    if expected == "nan:f64":
+        expects.add("-nan:f64")
 
     out, err = invoke(wasm, func, args, returncode)
 
@@ -252,7 +257,7 @@ def test_assert_return(wasm, form):
     if m.group(2) == '':
         args = []
     else:
-        args = [v.split(' ')[1] for v in re.split("\)\s*\(", m.group(2)[1:-1])]
+        args = [re.split(' +', v)[1] for v in re.split("\)\s*\(", m.group(2)[1:-1])]
     result, expected = parse_const(m.group(3)[1:-1])
 
     test_assert("return", wasm, func, args, expected)
@@ -269,7 +274,7 @@ def test_assert_trap(wasm, form):
     if m.group(2) == '':
         args = []
     else:
-        args = [v.split(' ')[1] for v in re.split("\)\s*\(", m.group(2)[1:-1])]
+        args = [re.split(' +', v)[1] for v in re.split("\)\s*\(", m.group(2)[1:-1])]
     expected = m.group(3)
 
     test_assert("trap", wasm, func, args, expected, returncode=1)
@@ -286,7 +291,7 @@ def do_invoke(wasm, form):
     if m.group(2) == '':
         args = []
     else:
-        args = [v.split(' ')[1] for v in re.split("\)\s*\(", m.group(2)[1:-1])]
+        args = [re.split(' +', v)[1] for v in re.split("\)\s*\(", m.group(2)[1:-1])]
 
     print("Invoking %s(%s)" % (
         func, ", ".join([str(a) for a in args])))
@@ -299,8 +304,7 @@ def skip_test(form):
             return True
     return False
 
-def run_test_file(test_file):
-    print("WAST2WASM: '%s'" % WAST2WASM)
+def run_test_file(wast2wasm, wa_cmd, test_file):
     (t1fd, wast_tempfile) = tempfile.mkstemp(suffix=".wast")
     (t2fd, wasm_tempfile) = tempfile.mkstemp(suffix=".wasm")
     print("wast_tempfile: '%s'" % wast_tempfile)
@@ -309,6 +313,8 @@ def run_test_file(test_file):
     try:
         forms = read_forms(file(test_file).read())
 
+        runner = None
+
         for form in forms:
             if  ";;" == form[0:2]:
                 print(form)
@@ -316,13 +322,25 @@ def run_test_file(test_file):
                 print("Writing WAST module to '%s'" % wast_tempfile)
                 file(wast_tempfile, 'w').write(form)
                 print("Compiling WASM to '%s'" % wasm_tempfile)
-                subprocess.check_call([
-                    WAST2WASM,
-                    #"--no-check-assert-invalid-and-malformed",
-                    "--no-check",
-                    wast_tempfile,
-                    "-o",
-                    wasm_tempfile])
+                cmd = [ wast2wasm,
+                        #"--no-check-assert-invalid-and-malformed",
+                        "--no-check",
+                        wast_tempfile,
+                        "-o",
+                        wasm_tempfile ]
+                #print("Running: %s" % " ".join(cmd))
+                subprocess.check_call(cmd)
+
+                print("Loading module WASM from '%s'" % wasm_tempfile)
+                cmd = [wa_cmd, "--repl", wasm_tempfile]
+                #print("Running: %s" % " ".join(cmd))
+
+                runner = Popen(cmd, stdout=PIPE, stderr=PIPE)
+                #(out, err) = runner.communicate()
+                #if runner.returncode != returncode:
+                #    raise Exception("Failed (retcode expected: %d, got: %d)\n%s" % (
+                #        returncode, runner.returncode, err))
+                #return out, err
             elif skip_test(form):
                 print("Skipping test: %s" % form[0:60])
             elif re.match("^\(assert_return\\b.*", form):
@@ -342,6 +360,9 @@ def run_test_file(test_file):
             elif re.match("^\(assert_unlinkable\\b.*", form):
                 print("ignoring assert_unlinkable")
                 pass
+            elif re.match("^\(assert_return_nan\\b.*", form):
+                print("ignoring assert_return_nan")
+                pass
             else:
                 raise Exception("unrecognized form '%s...'" % form[0:40])
     finally:
@@ -354,4 +375,15 @@ def run_test_file(test_file):
                 [wast_tempfile, wasm_tempfile]))
 
 if __name__ == "__main__":
-    run_test_file(sys.argv[1])
+    WAST2WASM = os.environ.get("WAST2WASM", "wast2wasm")
+    WA_CMD = os.environ.get("WA_CMD", "./warpy.py")
+
+    if WA_CMD.endswith(".py"):
+        SKIP_TESTS = PY_SKIP_TESTS
+    else:
+        SKIP_TESTS = C_SKIP_TESTS
+
+
+    print("WA_CMD: '%s'" % WA_CMD)
+    print("WAST2WASM: '%s'" % WAST2WASM)
+    run_test_file(WAST2WASM, WA_CMD, sys.argv[1])

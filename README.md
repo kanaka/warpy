@@ -60,6 +60,11 @@ functions within a module:
 webassembly> addTwo 2 3
 ```
 
+## Misc
+
+Some rough notes for running the WebAssembly specification tests can
+be found in notes\_testing.md.
+
 ## License
 
 MPL-2.0 (see LICENSE)
