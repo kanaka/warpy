@@ -1,11 +1,11 @@
 #!/usr/bin/env python
 
-#INFO  = False   # informational logging
-#TRACE = False   # trace instructions/stacks
-#DEBUG = False   # verbose logging
-INFO  = True    # informational logging
+INFO  = False   # informational logging
 TRACE = False   # trace instructions/stacks
-DEBUG = True    # verbose logging
+DEBUG = False   # verbose logging
+#INFO  = True    # informational logging
+#TRACE = True    # trace instructions/stacks
+#DEBUG = True    # verbose logging
 VALIDATE= True
 
 import sys, os, math
@@ -950,7 +950,7 @@ def do_call(stack, callstack, sp, fp, csp, func, pc):
 
 
 @unroll_safe
-def do_call_import(stack, sp, memory, host_import_func, func):
+def do_call_import(stack, sp, memory, import_function, func):
     t = func.type
 
     # make sure args match type signature
@@ -968,8 +968,8 @@ def do_call_import(stack, sp, memory, host_import_func, func):
     # Workaround rpython failure to identify type
     results = [(0, 0, 0.0)]
     results.pop()
-    results.extend(host_import_func(memory,
-            func.module, func.field, args))
+    args.reverse()
+    results.extend(import_function(func.module, func.field, memory, args))
 
     # make sure returns match type signature
     for idx, rtype in enumerate(t.results):
@@ -1180,7 +1180,7 @@ def interpret_mvp(module,
                         func.module, func.field,
                         ",".join([VALUE_TYPE[a] for a in t.params])))
                 sp = do_call_import(stack, sp, memory,
-                        module.host_import_func, func)
+                        module.import_function, func)
             elif isinstance(func, Function):
                 pc, sp, fp, csp = do_call(stack, callstack, sp, fp,
                         csp, func, pc)
@@ -2034,22 +2034,27 @@ class Export():
 
 
 class Module():
-    def __init__(self, data, host_import_func, exports):
+    def __init__(self, data, import_value, import_function, memory=None):
         assert isinstance(data, str)
         self.data = data
         self.rdr = Reader([ord(b) for b in data])
-        self.host_import_func = host_import_func
-        self.exports = exports
+        self.import_value = import_value
+        self.import_function = import_function
 
         # Sections
         self.type = []
         self.import_list = []
         self.function = []
+        self.fn_import_cnt = 0
         self.table = {}
         self.export_list = []
         self.export_map = {}
-        self.memory = Memory(1)  # default to 1 page
         self.global_list = []
+
+        if memory:
+            self.memory = memory
+        else:
+            self.memory = Memory(1)  # default to 1 page
 
         # block/loop/if blocks {start addr: Block, ...}
         self.block_map = {}
@@ -2067,7 +2072,7 @@ class Module():
         self.read_version()
         self.read_sections()
 
-        self.dump()
+#        self.dump()
 
         # Run the start function if set
         if self.start_function >= 0:
@@ -2221,6 +2226,7 @@ class Module():
                 self.import_list.append(imp)
                 func = FunctionImport(type, module, field)
                 self.function.append(func)
+                self.fn_import_cnt += 1
             elif kind in [0x1,0x2]:  # Table & Memory
                 if kind == 0x1:
                     etype = self.rdr.read_LEB(7) # TODO: ignore?
@@ -2235,11 +2241,7 @@ class Module():
             elif kind == 0x3:  # Global
                 type = self.rdr.read_byte()
                 mutability = self.rdr.read_LEB(1)
-                if "%s.%s" % (module, field) == "spectest.global":
-                    self.global_list.append((type, 666, 666.6))
-                else:
-                    raise Exception("unsupported global import %s.%s" % (
-                        module, field))
+                self.global_list.append(self.import_value(module, field))
 
     def parse_Function(self, length):
         count = self.rdr.read_LEB(32)
@@ -2278,12 +2280,11 @@ class Module():
 
     def parse_Global(self, length):
         count = self.rdr.read_LEB(32)
-        print("parse_Global count: %s" % count)
         for c in range(count):
             content_type = self.rdr.read_LEB(7)
             mutable = self.rdr.read_LEB(1)
-            print("global: content_type: %s, mutable: %s"
-                    % (content_type, mutable))
+#            print("global: content_type: %s, mutable: %s"
+#                    % (content_type, mutable))
             # Run the init_expr
             block = Block(0x00, BLOCK_TYPE[content_type], self.rdr.pos)
             self.csp += 1
@@ -2293,7 +2294,7 @@ class Module():
             _, _, self.sp, self.fp, self.csp = pop_block(
                     self.stack, self.callstack, self.sp, self.fp, self.csp)
             init_val = self.stack[self.sp]
-            print("init_val: %s" % init_val)
+#            print("init_val: (%d, %d, %f)" % init_val)
             self.sp -= 1
             assert content_type == init_val[0]
             self.global_list.append(init_val)
@@ -2358,19 +2359,18 @@ class Module():
         start = self.rdr.pos
         self.rdr.read_bytes(body_size - (self.rdr.pos-payload_start)-1)
         end = self.rdr.pos
+        debug("  find_blocks idx: %d, start: 0x%x, end: 0x%x" % (idx, start, end))
         self.rdr.read_bytes(1)
         func = self.function[idx]
         assert isinstance(func,Function)
         func.update(locals, start, end)
-        debug("  find_blocks start: 0x%x, end: 0x%x" % (start, end))
         self.block_map = find_blocks(
                 self.rdr.bytes, start, end, self.block_map)
 
     def parse_Code(self, length):
         body_count = self.rdr.read_LEB(32)
-        import_cnt = len(self.import_list)
         for idx in range(body_count):
-            self.parse_Code_body(idx + import_cnt)
+            self.parse_Code_body(idx + self.fn_import_cnt)
 
     def parse_Data(self, length):
         seg_count = self.rdr.read_LEB(32)
@@ -2403,26 +2403,22 @@ class Module():
                 self.callstack)
 
 
-    def run(self, all_args):
+    def run(self, fname, args, print_return=False):
         # Reset stacks
         self.sp  = -1
         self.fp  = -1
         self.csp = -1
 
-        name = all_args[0]
-        args = all_args[1:]
+        fidx = self.export_map[fname].index
 
-        fidx = self.export_map[name].index
-
-        # Args are strings so convert to expected numeric type
+        # Check arg type
         tparams = self.function[fidx].type.params
         for idx, arg in enumerate(args):
-            arg = args[idx].lower()
-            assert isinstance(arg, str)
+            assert tparams[idx] == arg[0], "arg type mismatch"
             self.sp += 1
-            self.stack[self.sp] = parse_number(tparams[idx], arg)
+            self.stack[self.sp] = arg
 
-        info("Running function '%s' (0x%x)" % (name, fidx))
+        info("Running function '%s' (0x%x)" % (fname, fidx))
         if TRACE:
             dump_stacks(self.sp, self.stack, self.fp, self.csp,
                     self.callstack)
@@ -2434,25 +2430,22 @@ class Module():
         if TRACE:
             dump_stacks(self.sp, self.stack, self.fp, self.csp,
                     self.callstack)
+
+        targs = [value_repr(a) for a in args]
         if self.sp >= 0:
             ret = self.stack[self.sp]
             self.sp -= 1
-            info("%s(%s) = %s" % (
-                name, ",".join(args), value_repr(ret)))
-            print(value_repr(ret))
+            info("%s(%s) = %s" % (fname, ", ".join(targs), value_repr(ret)))
+            if print_return:
+                print(value_repr(ret))
         else:
-            info("%s(%s)" % (
-                name, ",".join(args)))
-            print("")
+            info("%s(%s)" % (fname, ", ".join(targs)))
         return 0
 
 ######################################
 # Imported functions points
 ######################################
 
-
-def writeline(s):
-    print(s)
 
 def readline(prompt):
     res = ''
@@ -2463,70 +2456,102 @@ def readline(prompt):
         res += buf
         if res[-1] == '\n': return res[:-1]
 
+def get_string(mem, addr):
+    slen = 0
+    assert addr >= 0
+    while mem.bytes[addr+slen] != 0: slen += 1
+    #slen = mem.bytes.index(0, addr) - addr
+    bytes = mem.bytes[addr:addr+slen]
+    return "".join([chr(b) for b in bytes])
 
+def put_string(mem, addr, str):
+    pos = addr
+    for i in range(len(str)):
+        mem.bytes[pos] = ord(str[i])
+        pos += 1
+    mem.bytes[pos] = 0 # zero terminated
+    return pos
 
-# Marshall, unmarshall for the imported functions
-# Current hard-coded for each function
-def call_import(mem, module, field, args):
-    fname = "%s.%s" % (module, field)
-    result = []
-    if   fname == "core.DEBUG":
-        if len(args) == 1:
-            print("DEBUG: %s" % (value_repr(args[0])))
-        elif len(args) == 2:
-            print("DEBUG: %s %s" % (
-                value_repr(args[0]), value_repr(args[1])))
-        else:
-            raise Exception("DEBUG called with > 2 args")
-    elif fname == "spectest.print":
-        assert len(args) == 1
-        assert args[0][0] == I32
-        val = args[0][1]
-        res = ""
-        while val > 0:
-            res = res + chr(val & 0xff)
-            val = val>>8
-        print("%s '%s'" % (value_repr(args[0]), res))
-    elif fname == "core.writeline":
-        addr = args[0][1]  # I32
-        assert addr >= 0
-        debug("writeline addr: %s" % addr)
+#
+# Imports (global values and functions)
 
-        length = read_I32(mem.bytes, addr)
-        assert length >= 0
-        bytes = mem.bytes[addr+4:addr+4+length]
-        str = "".join([chr(b) for b in bytes])
-        writeline(str)
-    elif fname == "core.readline":
-        addr = args[0][1]  # I32
-        max_length = args[1][1]  # I32
-        assert addr >= 0
-        assert max_length >= 0
-        debug("readline addr: %s, max_length: %s" % (addr,
-            max_length))
+IMPORT_VALUES = {
+    "spectest.global": (I32, 666, 666.6),
+    "env.memoryBase":  (I32, 0, 0.0),
+    "env.stdout":      (I32, 0, 0.0)
+}
 
-        try:
-            res = readline("user> ")
-            res = res[0:max_length]
-            length = len(res)
-
-            # first four bytes are length
-            write_I32(mem.bytes, addr, 0)
-            start = addr+4
-
-            pos = start
-
-            for i in range(length):
-                mem.bytes[pos] = ord(res[i])
-                pos += 1
-            write_I32(mem.bytes, addr, length)
-
-            result.append((I32, int(length), 0.0))
-        except EOFError:
-            result.append((I32, int(-1), 0.0))
+def import_value(module, field):
+    iname = "%s.%s" % (module, field)
+    #return (I32, 377, 0.0)
+    if iname in IMPORT_VALUES:
+        return IMPORT_VALUES[iname]
     else:
-        raise Exception("invalid import %s.%s" % (module, field))
-    return result
+        raise Exception("global import %s not found" % (iname))
+
+def spectest_print(mem, args):
+    assert len(args) == 1
+    assert args[0][0] == I32
+    val = args[0][1]
+    res = ""
+    while val > 0:
+        res = res + chr(val & 0xff)
+        val = val>>8
+    print("%s '%s'" % (value_repr(args[0]), res))
+    return []
+
+def env_fputs(mem, args):
+    os.write(1, get_string(mem, args[0][1]))
+    return [(I32, 1, 1.0)]
+
+def env_readline(mem, args):
+    prompt = get_string(mem, args[0][1])
+    buf = args[1][1]        # I32
+    max_length = args[2][1] # I32
+
+    try:
+        str = readline(prompt)
+        max_length -= 1
+        assert max_length >= 0
+        str = str[0:max_length]
+        put_string(mem, buf, str)
+        return [(I32, buf, 0.0)]
+    except EOFError:
+        return [(I32, 0, 0.0)]
+
+def env_read_file(mem, args):
+    path = get_string(mem, args[0][1])
+    buf = args[1][1]
+    content = open(path).read()
+    slen = put_string(mem, buf, content)
+    return [(I32, slen, 0.0)]
+
+
+def import_function(module, field, mem, args):
+    fname = "%s.%s" % (module, field)
+#    return [(I32, 378, 0.0)]
+    if fname == "spectest.print":
+        return spectest_print(mem, args)
+    elif fname == "env.fputs":
+        return env_fputs(mem, args)
+    elif fname == "env.readline":
+        return env_readline(mem, args)
+    elif fname == "env.read_file":
+        return env_read_file(mem, args)
+    else:
+        raise Exception("function import %s not found" % (fname))
+
+def parse_command(module, args):
+    fname = args[0]
+    args = args[1:]
+    run_args = []
+    fidx = module.export_map[fname].index
+    tparams = module.function[fidx].type.params
+    for idx, arg in enumerate(args):
+        arg = args[idx].lower()
+        assert isinstance(arg, str)
+        run_args.append(parse_number(tparams[idx], arg))
+    return fname, run_args
 
 
 ######################################
@@ -2537,10 +2562,23 @@ def entry_point(argv):
     try:
         # Argument handling
         repl = False
+        argv_mode = False
+        memory_pages = 1
+        fname = None
         args = []
-        for arg in argv[1:]:
+        run_args = []
+        idx = 1
+        while idx < len(argv):
+            arg = argv[idx]
+            idx += 1
             if arg == "--repl":
                 repl = True
+            elif arg == "--argv":
+                argv_mode = True
+                memory_pages = 256
+            elif arg == "--memory-pages":
+                memory_pages = int(argv[idx])
+                idx += 1
             elif arg == "--":
                 continue
             else:
@@ -2550,12 +2588,42 @@ def entry_point(argv):
 
         #
 
-        m = Module(wasm, call_import, {})
+        mem = Memory(memory_pages)
+
+        if argv_mode:
+            # Convert args into C argv style array of strings and
+            # store at the beginning of memory. This must be before
+            # the module is initialized so that we can properly set
+            # the memoryBase global before it is imported.
+            fname = "_main"
+            args.insert(0, argv[0])
+            string_next = (len(args) + 1) * 4
+            for i, arg in enumerate(args):
+                slen = put_string(mem, string_next, arg)
+                write_I32(mem.bytes, i*4, string_next) # zero terminated
+                string_next += slen
+
+            # Set memoryBase to next 64-bit aligned address
+            string_next += (8 - (string_next % 8))
+            IMPORT_VALUES['env.memoryBase'] = (I32, string_next, 0.0)
+
+            run_args = [(I32, len(args), 0.0), (I32, 0, 0.0)]
+
+        m = Module(wasm, import_value, import_function, mem)
+
+        if not argv_mode:
+            # Convert args to expected numeric type. This must be
+            # after the module is initialized so that we know what
+            # types the arguments are
+            fname, run_args = parse_command(m, args)
+
+        if '__post_instantiate' in m.export_map:
+            m.run('__post_instantiate', [])
 
         if not repl:
             # Invoke one function and exit
             try:
-                return m.run(args)
+                return m.run(fname, run_args, not argv_mode)
             except WAException as e:
                 if not IS_RPYTHON:
                     os.write(2, "".join(traceback.format_exception(*sys.exc_info())))
@@ -2568,7 +2636,8 @@ def entry_point(argv):
                     line = readline("webassembly> ")
                     if line == "": continue
 
-                    res = m.run([l for l in line.split(' ') if l])
+                    fname, run_args = parse_command(m, line.split(' '))
+                    res = m.run(fname, run_args, True)
                     if not res == 0:
                         return res
 
