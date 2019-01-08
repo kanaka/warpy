@@ -1,0 +1,50 @@
+# general
+i64\.const 0x[89aAdDfF][0-9a-fA-F]{15}
+
+# names.wast
+invoke \"~!
+
+# elem.wast
+module1
+
+# endianness.wast
+f32_store.*-1.*-1
+f32_store.*1234e-5
+f32_store.*4242.4242
+
+# traps.wast
+no_dce.*trunc.*nan
+
+# memory_grow.wast
+grow.*i32.const 0x1000[01]
+grow.*i32.const 64736
+grow.*i32.const 1.*i32.const -1
+
+# memory_redundancy.wast
+invoke.*test_store_to_load
+invoke.*test_dead_store
+
+# i64.wast
+div_u.*i64\.const 5.*i64\.const -2
+rot.*i64\.const
+
+# f32.wast
+f32.const -?0x1.fffffep\+127
+(mul|div).*f32.const -?0x1p-(126|149)
+div.*f32.const -?0x[01]p[-+][01].*f32.const -?inf
+
+# float_misc.wast
+f32.const 0x1.93e592p\+99
+f32.const -0x1.907e8ap\+46
+f32.const 1e2[05].*f32.const 1e2[05]
+f32.const 0x1p[-+](64|75).*f32.const 0x1p[-+](64|75)
+f32.const 8391667.0.*f32.const 12582905.0
+f32.const 0x1.6a6c5ap-48.*f32.const 0x1.fa0b7p\+127
+f32.const 0x1.616fb2p-87.*f32.const 0x1.332172p\+68
+f32.const -0x1.c2c54ap\+69.*f32.const -0x1.00d142p-86
+f32.const 0x1.78599p\+90.*f32.const 0x1.534144p\+87
+f32.const 0x1.64b2a4p\+26.*f32.const 0x1.e95752p-119
+f32.const 0x1.42b5b6p-4.*f32.const 0x1.1f6d0ep-2
+f32.const 0x1.65787cp\+118.*f32.const 0x1.2e82a4p\+59
+nearest.*const -3.5.*const -4.0
+nearest.*const -?0x1.fffff*e?p\+(22|51)

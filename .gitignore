@@ -1,2 +1,4 @@
 *.pyc
 test/*.wasm
+warpy-nojit
+warpy-jit

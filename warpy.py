@@ -11,6 +11,7 @@ VALIDATE= True
 import sys, os, math
 IS_RPYTHON = sys.argv[0].endswith('rpython')
 
+sys.path.append(os.path.abspath('./pypy2-v5.6.0-src'))
 if IS_RPYTHON:
     # JIT Stuff
     from rpython.jit.codewriter.policy import JitPolicy
@@ -25,6 +26,12 @@ if IS_RPYTHON:
     from rpython.rlib.rfloat import round_double
     from rpython.rlib.rarithmetic import (
             intmask, string_to_int)
+
+    from pypy.objspace.std.objspace import StdObjSpace
+    from pypy.objspace.std.floatobject import W_FloatObject
+    _tmpspace = StdObjSpace()
+    _tmpspace.call_function = lambda f, a: a
+
 
     class IntSort(TimSort):
         def lt(self, a, b):
@@ -53,8 +60,12 @@ if IS_RPYTHON:
     def fround(val, digits):
         return round_double(val, digits)
 
+    @elidable
+    def float_fromhex(s):
+        fo = W_FloatObject.descr_fromhex(_tmpspace, None, s)
+        return fo.floatval
+
 else:
-    sys.path.append(os.path.abspath('./pypy2-v5.6.0-src'))
     import traceback
     import struct
 
@@ -81,6 +92,10 @@ else:
     def fround(val, digits):
         return round(val, digits)
 
+    def float_fromhex(s):
+        return float.fromhex(s)
+
+
 
 ######################################
 # Basic low-level types/classes
@@ -96,6 +111,7 @@ class Type():
         self.form = form
         self.params = params
         self.results = results
+        self.mask = 0x80
 
 class Code():
     pass
@@ -490,6 +506,7 @@ def parse_nan(type, arg):
 
 @elidable
 def parse_number(type, arg):
+    arg = "".join([c for c in arg if c != '_'])
     if   type == I32:
         if   arg[0:2] == '0x':   v = (I32, string_to_int(arg,16), 0.0)
         elif arg[0:3] == '-0x':  v = (I32, string_to_int(arg,16), 0.0)
@@ -500,13 +517,15 @@ def parse_number(type, arg):
         else:                    v = (I64, string_to_int(arg,10), 0.0)
     elif type == F32:
         if   arg.find('nan')>=0: v = (F32, 0, parse_nan(type, arg))
-#        elif arg[0:2] == '0x':   v = (F32, 0, float.fromhex(arg))
-#        elif arg[0:3] == '-0x':  v = (F32, 0, float.fromhex(arg))
+        elif arg.find('inf')>=0: v = (F32, 0, float_fromhex(arg))
+        elif arg[0:2] == '0x':   v = (F32, 0, float_fromhex(arg))
+        elif arg[0:3] == '-0x':  v = (F32, 0, float_fromhex(arg))
         else:                    v = (F32, 0, float(arg))
     elif type == F64:
         if   arg.find('nan')>=0: v = (F64, 0, parse_nan(type, arg))
-#        elif arg[0:2] == '0x':   v = (F64, 0, float.fromhex(arg))
-#        elif arg[0:3] == '-0x':  v = (F64, 0, float.fromhex(arg))
+        elif arg.find('inf')>=0: v = (F64, 0, float_fromhex(arg))
+        elif arg[0:2] == '0x':   v = (F64, 0, float_fromhex(arg))
+        elif arg[0:3] == '-0x':  v = (F64, 0, float_fromhex(arg))
         else:                    v = (F64, 0, float(arg))
     else:
         raise Exception("invalid number %s" % arg)
@@ -694,7 +713,10 @@ def read_I64(bytes, pos):
 def read_F32(bytes, pos):
     assert pos >= 0
     bits = bytes2int32(bytes[pos:pos+4])
-    return fround(unpack_f32(bits), 5)
+    num = unpack_f32(bits)
+    # fround hangs if called with nan
+    if math.isnan(num): return num
+    return fround(num, 5)
 
 @elidable
 def read_F64(bytes, pos):
@@ -727,14 +749,19 @@ def value_repr(val):
             # TODO: fix this to be like python
             return "%f:%s" % (fval, vtn)
         else:
-            return "%.7g:%s" % (fval, vtn)
+            str = "%.7g" % fval
+            if str.find('.') < 0:
+                return "%f:%s" % (fval, vtn)
+            else:
+                return "%s:%s" % (str, vtn)
     else:
         raise Exception("unknown value type %s" % vtn)
 
 def type_repr(t):
-    return "<form: %s, params: %s, results: %s>" % (
-        VALUE_TYPE[t.form], [VALUE_TYPE[p] for p in t.params],
-        [VALUE_TYPE[r] for r in t.results])
+    return "<index: %s, form: %s, params: %s, results: %s, mask: %s>" % (
+            t.index, VALUE_TYPE[t.form],
+            [VALUE_TYPE[p] for p in t.params],
+            [VALUE_TYPE[r] for r in t.results], hex(t.mask))
 
 def export_repr(e):
     return "<kind: %s, field: '%s', index: 0x%x>" % (
@@ -895,8 +922,9 @@ def pop_block(stack, callstack, sp, fp, csp):
         save = stack[sp]
         sp -= 1
         if save[0] != t.results[0]:
-            raise WAException("call signature mismatch: %s != %s" % (
-                VALUE_TYPE[t.results[0]], VALUE_TYPE[save[0]]))
+            raise WAException("call signature mismatch: %s != %s (%s)" % (
+                VALUE_TYPE[t.results[0]], VALUE_TYPE[save[0]],
+                value_repr(save)))
 
         # Restore value stack to original size prior to call/block
         if orig_sp < sp:
@@ -913,11 +941,10 @@ def pop_block(stack, callstack, sp, fp, csp):
     return block, ra, sp, orig_fp, csp
 
 @unroll_safe
-def do_call(stack, callstack, sp, fp, csp, func, pc):
+def do_call(stack, callstack, sp, fp, csp, func, pc, indirect=False):
 
     # Push block, stack size and return address onto callstack
     t = func.type
-    if VALIDATE: assert csp < CALLSTACK_SIZE, "call stack exhausted"
     csp += 1
     callstack[csp] = (func, sp-len(t.params), fp, pc)
 
@@ -931,14 +958,6 @@ def do_call(stack, callstack, sp, fp, csp, func, pc):
 
     # set frame pointer to include parameters
     fp = sp - len(t.params) + 1
-    # validate parameters
-    if VALIDATE:
-        for tidx in range(len(t.params)):
-            val = stack[fp+tidx]
-            ptype = t.params[tidx]
-            if ptype != val[0]:
-                raise WAException("call signature mismatch: %s != %s" % (
-                    VALUE_TYPE[ptype], VALUE_TYPE[val[0]]))
 
     # push locals (dropping extras)
     for lidx in range(len(func.locals)):
@@ -953,17 +972,17 @@ def do_call(stack, callstack, sp, fp, csp, func, pc):
 def do_call_import(stack, sp, memory, import_function, func):
     t = func.type
 
-    # make sure args match type signature
     args = []
     for idx in range(len(t.params)-1, -1, -1):
         arg = stack[sp]
         sp -= 1
         args.append(arg)
-        if VALIDATE:
-            ptype = t.params[idx]
-            if ptype != arg[0]:
-                raise WAException("call signature mismatch: %s != %s" % (
-                    VALUE_TYPE[ptype], VALUE_TYPE[arg[0]]))
+#        if VALIDATE:
+#            # make sure args match type signature
+#            ptype = t.params[idx]
+#            if ptype != arg[0]:
+#                raise WAException("call signature mismatch: %s != %s" % (
+#                    VALUE_TYPE[ptype], VALUE_TYPE[arg[0]]))
 
     # Workaround rpython failure to identify type
     results = [(0, 0, 0.0)]
@@ -1000,7 +1019,7 @@ def get_function(function, fidx):
 
 @elidable
 def bound_violation(opcode, addr, pages):
-    return addr+LOAD_SIZE[opcode] > pages*(2**16)
+    return addr < 0 or addr+LOAD_SIZE[opcode] > pages*(2**16)
 
 @elidable
 def get_from_table(table, tidx, table_index):
@@ -1187,7 +1206,6 @@ def interpret_mvp(module,
                 if TRACE: debug("      - calling function fidx: %d"
                                 " at: 0x%x" % (fidx, pc))
         elif 0x11 == opcode:  # call_indirect
-            # TODO: what do we do with tidx?
             pc, tidx = read_LEB(code, pc, 32)
             pc, reserved = read_LEB(code, pc, 1)
             type_index_val = stack[sp]
@@ -1197,8 +1215,12 @@ def interpret_mvp(module,
             promote(table_index)
             fidx = get_from_table(table, ANYFUNC, table_index)
             promote(fidx)
+            if VALIDATE: assert csp < CALLSTACK_SIZE, "call stack exhausted"
+            func = get_function(function, fidx)
+            if VALIDATE and func.type.mask != module.type[tidx].mask:
+                raise WAException("indirect call type mismatch (call type %s and function type %s differ" % (func.type.index, tidx))
             pc, sp, fp, csp = do_call(stack, callstack, sp, fp, csp,
-                    get_function(function, fidx), pc)
+                    func, pc, True)
             if TRACE:
                 debug("      - table idx: 0x%x, tidx: 0x%x,"
                       " calling function fidx: 0x%x at 0x%x" % (
@@ -1268,9 +1290,9 @@ def interpret_mvp(module,
                          " offset: 0x%x, addr: 0x%x" % (
                              flags, offset, addr_val[1]))
             addr = addr_val[1] + offset
-            assert addr >= 0
             if bound_violation(opcode, addr, memory.pages):
                 raise WAException("out of bounds memory access")
+            assert addr >= 0
             if   0x28 == opcode:  # i32.load
                 res = (I32, bytes2uint32(memory.bytes[addr:addr+4]), 0.0)
             elif 0x29 == opcode:  # i64.load
@@ -1319,9 +1341,9 @@ def interpret_mvp(module,
                          " offset: 0x%x, addr: 0x%x, val: 0x%x" % (
                              flags, offset, addr_val[1], val[1]))
             addr = addr_val[1] + offset
-            assert addr >= 0
             if bound_violation(opcode, addr, memory.pages):
                 raise WAException("out of bounds memory access")
+            assert addr >= 0
             if   0x36 == opcode:  # i32.store
                 write_I32(memory.bytes, addr, val[1])
             elif 0x37 == opcode:  # i64.store
@@ -1527,7 +1549,8 @@ def interpret_mvp(module,
 
         # unary
         elif opcode in [0x67, 0x68, 0x69, 0x79, 0x7a, 0x7b, 0x8b,
-                        0x8c, 0x99, 0x9a]:
+                        0x8c, 0x8d, 0x8e, 0x8f, 0x90, 0x91, 0x99,
+                        0x9a, 0x9b, 0x9c, 0x9d, 0x9e, 0x9f]:
             a = stack[sp]
             sp -= 1
             if   0x67 == opcode: # i32.clz
@@ -1562,7 +1585,7 @@ def interpret_mvp(module,
                     res = (I64, 0, 0.0)
                 else:
                     count = 1
-                    while count < 63 and (val & 0x4000000000000000) == 0:
+                    while count < 64 and (val & 0x4000000000000000) == 0:
                         count += 1
                         val = val * 2
                     res = (I64, count, 0.0)
@@ -1589,12 +1612,58 @@ def interpret_mvp(module,
             elif 0x8c == opcode: # f32.neg
                 if VALIDATE: assert a[0] == F32
                 res = (F32, 0, -a[2])
+            elif 0x8d == opcode: # f32.ceil
+                if VALIDATE: assert a[0] == F32
+                res = (F32, 0, math.ceil(a[2]))
+            elif 0x8e == opcode: # f32.floor
+                if VALIDATE: assert a[0] == F32
+                res = (F32, 0, math.floor(a[2]))
+            elif 0x8f == opcode: # f32.trunc
+                if VALIDATE: assert a[0] == F32
+                if math.isinf(a[2]):
+                    res = (F32, 0, a[2])
+                elif a[2] > 0:
+                    res = (F32, 0, math.floor(a[2]))
+                else:
+                    res = (F32, 0, math.ceil(a[2]))
+            elif 0x90 == opcode: # f32.nearest
+                if VALIDATE: assert a[0] == F32
+                if a[2] <= 0.0:
+                    res = (F32, 0, math.ceil(a[2]))
+                else:
+                    res = (F32, 0, math.floor(a[2]))
+            elif 0x91 == opcode: # f32.sqrt
+                if VALIDATE: assert a[0] == F32
+                res = (F32, 0, math.sqrt(a[2]))
             elif 0x99 == opcode: # f64.abs
                 if VALIDATE: assert a[0] == F64
                 res = (F64, 0, abs(a[2]))
             elif  0x9a == opcode: # f64.neg
                 if VALIDATE: assert a[0] == F64
                 res = (F64, 0, -a[2])
+            elif 0x9b == opcode: # f64.ceil
+                if VALIDATE: assert a[0] == F64
+                res = (F64, 0, math.ceil(a[2]))
+            elif 0x9c == opcode: # f64.floor
+                if VALIDATE: assert a[0] == F64
+                res = (F64, 0, math.floor(a[2]))
+            elif 0x9d == opcode: # f64.trunc
+                if VALIDATE: assert a[0] == F64
+                if math.isinf(a[2]):
+                    res = (F64, 0, a[2])
+                elif a[2] > 0:
+                    res = (F64, 0, math.floor(a[2]))
+                else:
+                    res = (F64, 0, math.ceil(a[2]))
+            elif 0x9e == opcode: # f64.nearest
+                if VALIDATE: assert a[0] == F64
+                if a[2] <= 0.0:
+                    res = (F64, 0, math.ceil(a[2]))
+                else:
+                    res = (F64, 0, math.floor(a[2]))
+            elif  0x9f == opcode: # f64.sqrt
+                if VALIDATE: assert a[0] == F64
+                res = (F64, 0, math.sqrt(a[2]))
             else:
                 raise WAException("%s(0x%x) unimplemented" % (
                     OPERATOR_INFO[opcode][0], opcode))
@@ -1649,10 +1718,10 @@ def interpret_mvp(module,
                 res = (I32, int2int32(a[1]) >> (b[1] % 0x20), 0.0)
             elif 0x76 == opcode: # i32.shr_u
                 res = (I32, int2uint32(a[1]) >> (b[1] % 0x20), 0.0)
-#            elif 0x77 == opcode: # i32.rotl
-#                res = (I32, rotl32(a[1], b[1]), 0.0)
-#            elif 0x78 == opcode: # i32.rotr
-#                res = (I32, rotr32(a[1], b[1]), 0.0)
+            elif 0x77 == opcode: # i32.rotl
+                res = (I32, rotl32(a[1], b[1]), 0.0)
+            elif 0x78 == opcode: # i32.rotr
+                res = (I32, rotr32(a[1], b[1]), 0.0)
             else:
                 raise WAException("%s(0x%x) unimplemented" % (
                     OPERATOR_INFO[opcode][0], opcode))
@@ -1744,7 +1813,9 @@ def interpret_mvp(module,
                 else:
                     res = (F32, 0, b[2])
             elif 0x97 == opcode: # f32.max
-                if a[2] > b[2]:
+                if a[2] == b[2] == 0.0:
+                    res = (F32, 0, 0.0)
+                elif a[2] > b[2]:
                     res = (F32, 0, a[2])
                 else:
                     res = (F32, 0, b[2])
@@ -1774,15 +1845,33 @@ def interpret_mvp(module,
             elif 0xa2 == opcode: # f64.mul
                 res = (F64, 0, a[2] * b[2])
             elif 0xa3 == opcode: # f64.div
-                res = (F64, 0, a[2] / b[2])
+                if b[2] == 0.0:
+                    aneg = str(a[2])[0] == '-'
+                    bneg = str(b[2])[0] == '-'
+                    if (aneg and not bneg) or (not aneg and bneg):
+                        res = (F64, 0, float_fromhex('-inf'))
+                    else:
+                        res = (F64, 0, float_fromhex('inf'))
+                else:
+                    res = (F64, 0, a[2] / b[2])
             elif 0xa4 == opcode: # f64.min
                 if a[2] < b[2]:
                     res = (F64, 0, a[2])
+                elif b[2] == 0.0:
+                    if str(a[2])[0] == '-':
+                        res = (F64, 0, a[2])
+                    else:
+                        res = (F64, 0, b[2])
                 else:
                     res = (F64, 0, b[2])
             elif 0xa5 == opcode: # f64.max
                 if a[2] > b[2]:
                     res = (F64, 0, a[2])
+                elif b[2] == 0.0:
+                    if str(a[2])[0] == '-':
+                        res = (F64, 0, b[2])
+                    else:
+                        res = (F64, 0, a[2])
                 else:
                     res = (F64, 0, b[2])
             elif 0xa6 == opcode: # f64.copysign
@@ -2046,7 +2135,7 @@ class Module():
         self.import_list = []
         self.function = []
         self.fn_import_cnt = 0
-        self.table = {}
+        self.table = {ANYFUNC: []}
         self.export_list = []
         self.export_map = {}
         self.global_list = []
@@ -2072,18 +2161,23 @@ class Module():
         self.read_version()
         self.read_sections()
 
-#        self.dump()
+        self.dump()
 
         # Run the start function if set
         if self.start_function >= 0:
             fidx = self.start_function
+            func = self.function[fidx]
             info("Running start function 0x%x" % fidx)
             if TRACE:
                 dump_stacks(self.sp, self.stack, self.fp, self.csp,
                         self.callstack)
-            self.rdr.pos, self.sp, self.fp, self.csp = do_call(
-                    self.stack, self.callstack, self.sp, self.fp,
-                    self.csp, self.function[fidx], len(self.rdr.bytes))
+            if isinstance(func, FunctionImport):
+                sp = do_call_import(self.stack, self.sp, self.memory,
+                        self.import_function, func)
+            elif isinstance(func, Function):
+                self.rdr.pos, self.sp, self.fp, self.csp = do_call(
+                        self.stack, self.callstack, self.sp, self.fp,
+                        self.csp, func, len(self.rdr.bytes))
             self.interpret()
 
     def dump(self):
@@ -2202,8 +2296,18 @@ class Module():
                 results.append(self.rdr.read_LEB(32))
             tidx = len(self.type)
             t = Type(tidx, form, params, results)
-            debug("  parsed type: %s" % type_repr(t))
             self.type.append(t)
+
+            # calculate a unique type mask
+            t.mask = 0x80
+            if result_count == 1:
+                t.mask |= 0x80 - results[0]
+            t.mask = t.mask << 4
+            for p in params:
+                t.mask = t.mask << 4
+                t.mask |= 0x80 - p
+
+            debug("  parsed type: %s" % type_repr(t))
 
 
     def parse_Import(self, length):
@@ -2283,18 +2387,18 @@ class Module():
         for c in range(count):
             content_type = self.rdr.read_LEB(7)
             mutable = self.rdr.read_LEB(1)
-#            print("global: content_type: %s, mutable: %s"
-#                    % (content_type, mutable))
+#            print("global: content_type: %s, BLOCK_TYPE: %s, mutable: %s"
+#                    % (VALUE_TYPE[content_type],
+#                        type_repr(BLOCK_TYPE[content_type]),
+#                        mutable))
             # Run the init_expr
             block = Block(0x00, BLOCK_TYPE[content_type], self.rdr.pos)
             self.csp += 1
             self.callstack[self.csp] = (block, self.sp, self.fp, 0)
             # WARNING: running code here to get offset!
             self.interpret()  # run iter_expr
-            _, _, self.sp, self.fp, self.csp = pop_block(
-                    self.stack, self.callstack, self.sp, self.fp, self.csp)
             init_val = self.stack[self.sp]
-#            print("init_val: (%d, %d, %f)" % init_val)
+#            print("init_val: %s" % value_repr(init_val))
             self.sp -= 1
             assert content_type == init_val[0]
             self.global_list.append(init_val)
@@ -2336,6 +2440,7 @@ class Module():
             offset = int(offset_val[1])
 
             num_elem = self.rdr.read_LEB(32)
+            self.table[ANYFUNC] = [0] * (offset + num_elem)
             table = self.table[ANYFUNC]
             for n in range(num_elem):
                 fidx = self.rdr.read_LEB(32)
@@ -2414,7 +2519,7 @@ class Module():
         # Check arg type
         tparams = self.function[fidx].type.params
         for idx, arg in enumerate(args):
-            assert tparams[idx] == arg[0], "arg type mismatch"
+            assert tparams[idx] == arg[0], "arg type mismatch %s != %s" % (tparams[idx], arg[0])
             self.sp += 1
             self.stack[self.sp] = arg
 
@@ -2476,9 +2581,9 @@ def put_string(mem, addr, str):
 # Imports (global values and functions)
 
 IMPORT_VALUES = {
-    "spectest.global": (I32, 666, 666.6),
-    "env.memoryBase":  (I32, 0, 0.0),
-    "env.stdout":      (I32, 0, 0.0)
+    "spectest.global_i32": (I32, 666, 666.6),
+    "env.memoryBase":      (I32, 0, 0.0),
+    "env.stdout":          (I32, 0, 0.0)
 }
 
 def import_value(module, field):
@@ -2490,6 +2595,7 @@ def import_value(module, field):
         raise Exception("global import %s not found" % (iname))
 
 def spectest_print(mem, args):
+    if len(args) == 0: return []
     assert len(args) == 1
     assert args[0][0] == I32
     val = args[0][1]
@@ -2530,7 +2636,7 @@ def env_read_file(mem, args):
 def import_function(module, field, mem, args):
     fname = "%s.%s" % (module, field)
 #    return [(I32, 378, 0.0)]
-    if fname == "spectest.print":
+    if fname in ["spectest.print", "spectest.print_i32"]:
         return spectest_print(mem, args)
     elif fname == "env.fputs":
         return env_fputs(mem, args)
@@ -2611,16 +2717,15 @@ def entry_point(argv):
 
         m = Module(wasm, import_value, import_function, mem)
 
-        if not argv_mode:
+        if '__post_instantiate' in m.export_map:
+            m.run('__post_instantiate', [])
+
+        if not repl:
             # Convert args to expected numeric type. This must be
             # after the module is initialized so that we know what
             # types the arguments are
             fname, run_args = parse_command(m, args)
 
-        if '__post_instantiate' in m.export_map:
-            m.run('__post_instantiate', [])
-
-        if not repl:
             # Invoke one function and exit
             try:
                 return m.run(fname, run_args, not argv_mode)
@@ -2646,6 +2751,13 @@ def entry_point(argv):
                 except EOFError as e:
                     break
 
+    except WAException as e:
+        if IS_RPYTHON:
+            llop.debug_print_traceback(lltype.Void)
+            os.write(2, "Exception: %s\n" % e)
+        else:
+            os.write(2, "".join(traceback.format_exception(*sys.exc_info())))
+            os.write(2, "Exception: %s\n" % e.message)
     except Exception as e:
         if IS_RPYTHON:
             llop.debug_print_traceback(lltype.Void)

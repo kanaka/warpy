@@ -15,8 +15,8 @@ path:
 make warpy-jit   # or make warpy-nojit
 ```
 
-Alternatively, you can build use an rypthon docker container (built
-from Dockerfile.rpython) and do the compilation from there:
+Alternatively, you can use an rypthon docker container (built
+from Dockerfile-rpython) and do the compilation from there:
 
 ```
 docker pull kanaka/warpy-rpython
@@ -63,7 +63,7 @@ webassembly> addTwo 2 3
 ## Misc
 
 Some rough notes for running the WebAssembly specification tests can
-be found in notes\_testing.md.
+be found in `notes\_testing`.
 
 ## License
 

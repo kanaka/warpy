@@ -1,0 +1,6 @@
+# int_literals.wast (should trigger integer overflow)
+i64.no_fold_div_neg1.*0x8000000000000000
+
+# i64
+i64\.const 0x7f{14}[df]
+div_u.*i64\.const 5.*i64\.const -2

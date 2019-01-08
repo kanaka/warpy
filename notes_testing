@@ -1,0 +1,19 @@
+BASIC_TESTS="block if br br_if br_table return loop select labels nop switch unwind stack get_local set_local tee_local globals unreachable func call call_indirect memory address left-to-right int_exprs i32 i64 f32 f64 endianness"
+
+OTHER_TESTS="break-drop forward func_ptrs fac unreached-invalid traps f32_cmp f64_cmp int_literals float_misc memory_grow memory_redundancy memory_trap start exports data elem"
+
+# These pass but mostly test test features (syntax, compilation)
+INGORE_TESTS="store_retval names binary custom_section typecheck skip-stack-guard-page"
+
+# These exhibit a failure either in runtest.py or runtime
+BROKE_TESTS="conversions float_literals float_exprs float_memory comments imports linking inline-module"
+
+export WA_CMD=./warpy.py WAST2WASM=./wabt-20181207/out/gcc/Release/wat2wasm
+time for t in ${BASIC_TESTS} ${OTHER_TESTS}; do
+    echo "TESTING ${t}"
+    ./runtest.py --wast2wasm ${WAST2WASM} --interpreter ${WA_CMD} --skip-list ./skip_both.txt --skip-list ./skip_py.txt ./wabt-20181207/third_party/testsuite/${t}.wast || break
+    echo
+done
+
+
+

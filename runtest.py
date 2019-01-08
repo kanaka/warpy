@@ -1,27 +1,171 @@
 #!/usr/bin/env python
 
 from __future__ import print_function
-import os, sys, re, subprocess, tempfile
-from subprocess import Popen, PIPE
+import os, sys, re
+import argparse, time
+import signal, atexit, tempfile, subprocess
 
-CLEANUP = False
+from subprocess import Popen, STDOUT, PIPE
+from select import select
 
-# regex patterns of tests to skip
-C_SKIP_TESTS = (
-        # names.wast
-        'invoke \"~!',
-        # conversions.wast
-        'reinterpret_f.*nan' )
-PY_SKIP_TESTS = (
-        # names.wast
-        'invoke \"~!',
-        # conversions.wast
-        '18446742974197923840.0',
-        '18446744073709549568.0',
-        '9223372036854775808',
-        'reinterpret_f.*nan',
-        # endianness
-        '.const 0x1.fff' )
+# Pseudo-TTY and terminal manipulation
+import pty, array, fcntl, termios
+
+IS_PY_3 = sys.version_info[0] == 3
+
+debug_file = None
+log_file = None
+
+def debug(data):
+    if debug_file:
+        debug_file.write(data)
+        debug_file.flush()
+
+def log(data, end='\n'):
+    if log_file:
+        log_file.write(data + end)
+        log_file.flush()
+    print(data, end=end)
+    sys.stdout.flush()
+
+# TODO: do we need to support '\n' too
+import platform
+if platform.system().find("CYGWIN_NT") >= 0:
+    # TODO: this is weird, is this really right on Cygwin?
+    sep = "\n\r\n"
+else:
+    sep = "\r\n"
+rundir = None
+
+class Runner():
+    def __init__(self, args, no_pty=False):
+        #print "args: %s" % repr(args)
+        self.no_pty = no_pty
+
+        # Cleanup child process on exit
+        atexit.register(self.cleanup)
+
+        self.p = None
+        env = os.environ
+        env['TERM'] = 'dumb'
+        env['INPUTRC'] = '/dev/null'
+        env['PERL_RL'] = 'false'
+        if no_pty:
+            self.p = Popen(args, bufsize=0,
+                           stdin=PIPE, stdout=PIPE, stderr=STDOUT,
+                           preexec_fn=os.setsid,
+                           env=env)
+            self.stdin = self.p.stdin
+            self.stdout = self.p.stdout
+        else:
+            # provide tty to get 'interactive' readline to work
+            master, slave = pty.openpty()
+
+            # Set terminal size large so that readline will not send
+            # ANSI/VT escape codes when the lines are long.
+            buf = array.array('h', [100, 200, 0, 0])
+            fcntl.ioctl(master, termios.TIOCSWINSZ, buf, True)
+
+            self.p = Popen(args, bufsize=0,
+                           stdin=slave, stdout=slave, stderr=STDOUT,
+                           preexec_fn=os.setsid,
+                           env=env)
+            # Now close slave so that we will get an exception from
+            # read when the child exits early
+            # http://stackoverflow.com/questions/11165521
+            os.close(slave)
+            self.stdin = os.fdopen(master, 'r+b', 0)
+            self.stdout = self.stdin
+
+        #print "started"
+        self.buf = ""
+        self.last_prompt = ""
+
+    def read_to_prompt(self, prompts, timeout):
+        end_time = time.time() + timeout
+        while time.time() < end_time:
+            [outs,_,_] = select([self.stdout], [], [], 1)
+            if self.stdout in outs:
+                new_data = self.stdout.read(1)
+                new_data = new_data.decode("utf-8") if IS_PY_3 else new_data
+                #print("new_data: '%s'" % new_data)
+                debug(new_data)
+                if self.no_pty:
+                    self.buf += new_data.replace("\n", "\r\n")
+                else:
+                    self.buf += new_data
+                self.buf = self.buf.replace("\r\r", "\r")
+                for prompt in prompts:
+                    regexp = re.compile(prompt)
+                    match = regexp.search(self.buf)
+                    if match:
+                        end = match.end()
+                        buf = self.buf[0:end-len(prompt)]
+                        self.buf = self.buf[end:]
+                        self.last_prompt = prompt
+                        return buf
+        return None
+
+    def writeline(self, str):
+        def _to_bytes(s):
+            return bytes(s, "utf-8") if IS_PY_3 else s
+
+        self.stdin.write(_to_bytes(str + "\n"))
+
+    def cleanup(self):
+        #print "cleaning up"
+        if self.p:
+            try:
+                os.killpg(self.p.pid, signal.SIGTERM)
+            except OSError:
+                pass
+            self.p = None
+
+def assert_prompt(runner, prompts, timeout):
+    # Wait for the initial prompt
+    header = runner.read_to_prompt(prompts, timeout=timeout)
+    if not header == None:
+        if header:
+            log("Started with:\n%s" % header)
+    else:
+        log("Did not one of following prompt(s): %s" % repr(prompts))
+        log("    Got      : %s" % repr(r.buf))
+        sys.exit(1)
+
+
+### WebAssembly specific
+
+parser = argparse.ArgumentParser(
+        description="Run a test file against a WebAssembly interpreter")
+parser.add_argument('--wast2wasm', type=str,
+        default=os.environ.get("WAST2WASM", "wast2wasm"),
+        help="Path to wast2wasm program")
+parser.add_argument('--interpreter', type=str,
+        default=os.environ.get("WA_CMD", "./wac"),
+        help="Path to WebAssembly interpreter")
+parser.add_argument('--verbose', action='store_true',
+        help="Verbose logging")
+parser.add_argument('--no-cleanup', action='store_true',
+        help="Keep temporary *.wasm files")
+
+parser.add_argument('--rundir',
+        help="change to the directory before running tests")
+parser.add_argument('--start-timeout', default=10, type=int,
+        help="default timeout for initial prompt")
+parser.add_argument('--test-timeout', default=20, type=int,
+        help="default timeout for each individual test action")
+parser.add_argument('--no-pty', action='store_true',
+        help="Use direct pipes instead of pseudo-tty")
+parser.add_argument('--log-file', type=str,
+        help="Write messages to the named file in addition the screen")
+parser.add_argument('--debug-file', type=str,
+        help="Write all test interaction the named file")
+parser.add_argument('--skip-list', action='append', default=[],
+        help="A file with a list of regex patterns of tests to skip.")
+
+parser.add_argument('test_file', type=argparse.FileType('r'),
+        help="a WebAssembly *.wast test file")
+
 
 def read_forms(string):
     forms = []
@@ -33,30 +177,46 @@ def read_forms(string):
         # Keep track of line number
         if string[pos] == '\n': line += 1
 
-        # Handle top-level elements
-        if depth == 0:
-            # Add top-level comments
-            if string[pos:pos+2] == ";;":
-                end = string.find("\n", pos)
-                if end == -1: end == len(string)
-                forms.append(string[pos:end])
-                pos = end
-                continue
+        # Ignore whitespace between top-level forms
+        if string[pos] in (' ', '\n', '\t'):
+            if depth != 0:
+                form += string[pos]
+            pos += 1
+            continue
 
-            # TODO: handle nested multi-line comments
-            if string[pos:pos+2] == "(;":
-                # Skip multi-line comment
-                end = string.find(";)", pos)
-                if end == -1:
-                    raise Exception("mismatch multiline comment on line %d: '%s'" % (
-                        line, string[pos:pos+80]))
-                pos = end+2
-                continue
+        #print("here0 line: %d, forms: %s" % (line, repr(forms)))
+        # Add top-level comments
+        if string[pos:pos+2] == ";;":
+            print
+            end = string.find("\n", pos)
+            if end == -1: end == len(string)
+            #form += string[pos:end]
+            #forms.append(string[pos:end])
+            pos = end
+            continue
 
-            # Ignore whitespace between top-level forms
-            if string[pos] in (' ', '\n', '\t'):
-                pos += 1
-                continue
+        # TODO: handle nested multi-line comments
+        if string[pos:pos+2] == "(;":
+            # Skip multi-line comment
+            end = string.find(";)", pos)
+            if end == -1:
+                raise Exception("mismatch multiline comment on line %d: '%s'" % (
+                    line, string[pos:pos+80]))
+            pos = end+2
+            continue
+
+        # handle strings
+        if string[pos] == '"':
+            end = string.find('"', pos+1)
+            # TODO: fix when backslash itself may be quoted
+            while string[end-1] == '\\':
+                end = string.find('"', end+1)
+            if end == -1:
+                raise Exception("unterminated string line %d: '%s'" % (
+                    line, string[pos:pos+80]))
+            form += string[pos:end+1]
+            pos = end+1
+            continue
 
         # Read a top-level form
         if string[pos] == '(': depth += 1
@@ -135,21 +295,24 @@ def hexpad32(i):
 def hexpad64(i):
     return "0x%016x" % i
 
-def invoke(wasm, func, args, returncode=0):
-    cmd = [WA_CMD, wasm, func, "--"] + args
-    #print("Running: %s" % " ".join(cmd))
+def invoke(r, args, cmd):
+    r.writeline(cmd.strip())
 
-    sp = Popen(cmd, stdout=PIPE, stderr=PIPE)
-    (out, err) = sp.communicate()
-    if sp.returncode != returncode:
-        raise Exception("Failed (retcode expected: %d, got: %d)\n%s" % (
-            returncode, sp.returncode, err))
-    return out, err
+    return r.read_to_prompt(['\r\nwebassembly> ', '\nwebassembly> '],
+            timeout=args.test_timeout)
 
-def test_assert(mode, wasm, func, args, expected, returncode=0):
-    print("Testing(%s) %s(%s) = %s" % (
-        mode, func, ", ".join(args), expected))
+def test_assert(r, opts, mode, cmd, expected):
+    log("Testing(%s) %s = %s" % (mode, cmd, expected))
 
+    out = invoke(r, opts, cmd)
+    outs = [''] + out.split('\n')[1:]
+    out = outs[-1]
+
+    if mode=='trap':
+        o = re.sub('^Exception: ', '', out)
+        e = re.sub('^Exception: ', '', expected)
+        if o.find(e) >= 0 or e.find(o) >= 0:
+            return True
 
     expects = set([expected])
     m0 = re.search("^(-?[0-9\.e-]+):f32$", expected)
@@ -167,10 +330,7 @@ def test_assert(mode, wasm, func, args, expected, returncode=0):
     if expected == "nan:f64":
         expects.add("-nan:f64")
 
-    out, err = invoke(wasm, func, args, returncode)
-
     # munge the output some
-    out = out.rstrip("\n")
     out = re.sub("L:i32$", ':i32', out)
     out = re.sub("L:i64$", ':i64', out)
     results = set([out])
@@ -219,27 +379,13 @@ def test_assert(mode, wasm, func, args, expected, returncode=0):
         results.add("%f:f64" % val)
         results.add("%.7g:f64" % val)
 
-    #print("  out: '%s'" % out)
-    #print("  err: %s" % err)
-    #print("expects: '%s', results: %s, returncode: %d" % (
-    #    expects, results, returncode))
-    if (expected.find("unreachable") > -1
-            and err.find("unreachable") > -1):
-        pass
-    elif (expected.find("call signature mismatch") > -1
-            and err.find("call signature mismatch") > -1):
-        pass
-    elif returncode==1 and err.find(expected) > -1:
-        pass
-    elif not expects.intersection(results):
-        if returncode==1:
-            raise Exception("Failed:\n  expected: '%s'\n  got: '%s'" % (
-                expected, err))
-        else:
-            raise Exception("Failed:\n  expected: '%s' %s\n  got: '%s' %s" % (
-                expected, expects, out, results))
+    if not expects.intersection(results):
+        raise Exception("Failed:\n  expected: '%s' %s\n  got: '%s' %s" % (
+            expected, expects, out, results))
 
-def test_assert_return(wasm, form):
+    return True
+
+def test_assert_return(r, opts, form):
     # params, return
     m = re.search('^\(assert_return\s+\(invoke\s+"((?:[^"]|\\\")*)"\s+(\(.*\))\s*\)\s*(\([^)]+\))\s*\)\s*$', form, re.S)
     if not m:
@@ -260,9 +406,9 @@ def test_assert_return(wasm, form):
         args = [re.split(' +', v)[1] for v in re.split("\)\s*\(", m.group(2)[1:-1])]
     result, expected = parse_const(m.group(3)[1:-1])
 
-    test_assert("return", wasm, func, args, expected)
+    test_assert(r, opts, "return", "%s %s" % (func, " ".join(args)), expected)
 
-def test_assert_trap(wasm, form):
+def test_assert_trap(r, opts, form):
     # params
     m = re.search('^\(assert_trap\s+\(invoke\s+"([^"]*)"\s+(\(.*\))\s*\)\s*"([^"]+)"\s*\)\s*$', form)
     if not m:
@@ -275,11 +421,11 @@ def test_assert_trap(wasm, form):
         args = []
     else:
         args = [re.split(' +', v)[1] for v in re.split("\)\s*\(", m.group(2)[1:-1])]
-    expected = m.group(3)
+    expected = "Exception: %s" % m.group(3)
 
-    test_assert("trap", wasm, func, args, expected, returncode=1)
+    test_assert(r, opts, "trap", "%s %s" % (func, " ".join(args)), expected)
 
-def do_invoke(wasm, form):
+def do_invoke(r, opts, form):
     # params
     m = re.search('^\(invoke\s+"([^"]+)"\s+(\(.*\))\s*\)\s*$', form)
     if not m:
@@ -293,97 +439,118 @@ def do_invoke(wasm, form):
     else:
         args = [re.split(' +', v)[1] for v in re.split("\)\s*\(", m.group(2)[1:-1])]
 
-    print("Invoking %s(%s)" % (
+    log("Invoking %s(%s)" % (
         func, ", ".join([str(a) for a in args])))
 
-    invoke(wasm, func, args)
+    invoke(r, opts, "%s %s" % (func, " ".join(args)))
 
-def skip_test(form):
-    for s in SKIP_TESTS:
+def skip_test(form, skip_list):
+    for s in skip_list:
         if re.search(s, form):
             return True
     return False
+def is_ascii(s):
+    return all(ord(c) > 8 and ord(c) < 128 for c in s)
 
-def run_test_file(wast2wasm, wa_cmd, test_file):
-    (t1fd, wast_tempfile) = tempfile.mkstemp(suffix=".wast")
-    (t2fd, wasm_tempfile) = tempfile.mkstemp(suffix=".wasm")
-    print("wast_tempfile: '%s'" % wast_tempfile)
-    print("wasm_tempfile: '%s'" % wasm_tempfile)
 
-    try:
-        forms = read_forms(file(test_file).read())
-
-        runner = None
-
-        for form in forms:
-            if  ";;" == form[0:2]:
-                print(form)
-            elif re.match("^\(module\\b.*", form):
-                print("Writing WAST module to '%s'" % wast_tempfile)
-                file(wast_tempfile, 'w').write(form)
-                print("Compiling WASM to '%s'" % wasm_tempfile)
-                cmd = [ wast2wasm,
-                        #"--no-check-assert-invalid-and-malformed",
-                        "--no-check",
-                        wast_tempfile,
-                        "-o",
-                        wasm_tempfile ]
-                #print("Running: %s" % " ".join(cmd))
-                subprocess.check_call(cmd)
-
-                print("Loading module WASM from '%s'" % wasm_tempfile)
-                cmd = [wa_cmd, "--repl", wasm_tempfile]
-                #print("Running: %s" % " ".join(cmd))
-
-                runner = Popen(cmd, stdout=PIPE, stderr=PIPE)
-                #(out, err) = runner.communicate()
-                #if runner.returncode != returncode:
-                #    raise Exception("Failed (retcode expected: %d, got: %d)\n%s" % (
-                #        returncode, runner.returncode, err))
-                #return out, err
-            elif skip_test(form):
-                print("Skipping test: %s" % form[0:60])
-            elif re.match("^\(assert_return\\b.*", form):
-                #print("%s" % form)
-                test_assert_return(wasm_tempfile, form)
-            elif re.match("^\(assert_trap\\b.*", form):
-                #print("%s" % form)
-                test_assert_trap(wasm_tempfile, form)
-            elif re.match("^\(invoke\\b.*", form):
-                do_invoke(wasm_tempfile, form)
-            elif re.match("^\(assert_invalid\\b.*", form):
-                #print("ignoring assert_invalid")
-                pass
-            elif re.match("^\(assert_exhaustion\\b.*", form):
-                print("ignoring assert_exhaustion")
-                pass
-            elif re.match("^\(assert_unlinkable\\b.*", form):
-                print("ignoring assert_unlinkable")
-                pass
-            elif re.match("^\(assert_return_nan\\b.*", form):
-                print("ignoring assert_return_nan")
-                pass
-            else:
-                raise Exception("unrecognized form '%s...'" % form[0:40])
-    finally:
-        if CLEANUP:
-            print("Removing tempfiles")
-            os.remove(wast_tempfile)
-            os.remove(wasm_tempfile)
+def cleanup_tempfiles(opts, files):
+    for f in files:
+        if not f: continue
+        if not opts.no_cleanup:
+            if opts.verbose:
+                log("Removing tempfile: %s" % (f))
+            os.remove(f)
         else:
-            print("Leaving tempfiles: %s" % (
-                [wast_tempfile, wasm_tempfile]))
+            if opts.verbose:
+                log("Leaving tempfile: %s" % (f))
 
 if __name__ == "__main__":
-    WAST2WASM = os.environ.get("WAST2WASM", "wast2wasm")
-    WA_CMD = os.environ.get("WA_CMD", "./warpy.py")
+    opts = parser.parse_args(sys.argv[1:])
 
-    if WA_CMD.endswith(".py"):
-        SKIP_TESTS = PY_SKIP_TESTS
-    else:
-        SKIP_TESTS = C_SKIP_TESTS
+    if opts.rundir: os.chdir(opts.rundir)
 
+    if opts.log_file:   log_file   = open(opts.log_file, "a")
+    if opts.debug_file: debug_file = open(opts.debug_file, "a")
 
-    print("WA_CMD: '%s'" % WA_CMD)
-    print("WAST2WASM: '%s'" % WAST2WASM)
-    run_test_file(WAST2WASM, WA_CMD, sys.argv[1])
+    skips = []
+    for f in opts.skip_list:
+        lines = open(f).readlines()
+        for line in lines:
+            if line.startswith("#") or line == "\n":
+                continue
+            skips.append(line.rstrip('\n'))
+    print("skips:", skips)
+
+    forms = read_forms(opts.test_file.read())
+    r = None
+    wast_tempfile = wasm_tempfile = None
+
+    for form in forms:
+        if  ";;" == form[0:2]:
+            log(form)
+        elif re.match("^\(assert_trap\s+\(module", form):
+            log("ignoring assert_trap around module")
+        elif re.match("^\(assert_exhaustion\\b.*", form):
+            log("ignoring assert_exhaustion")
+        elif re.match("^\(assert_unlinkable\\b.*", form):
+            log("ignoring assert_unlinkable")
+        elif re.match("^\(assert_malformed\\b.*", form):
+            log("ignoring assert_malformed")
+        elif re.match("^\(assert_return[_a-z]*_nan\\b.*", form):
+            log("ignoring assert_return_.*_nan")
+        elif re.match("^\(assert_return\s+\(get.*", form):
+            log("ignoring assert_return (get")
+        elif re.match(".*\(invoke\s+\$\\b.*", form):
+            log("ignoring invoke $FOO")
+
+        elif re.match("^\(module\\b.*", form):
+            cleanup_tempfiles(opts, [wast_tempfile, wasm_tempfile])
+            (t1fd, wast_tempfile) = tempfile.mkstemp(suffix=".wast")
+            (t2fd, wasm_tempfile) = tempfile.mkstemp(suffix=".wasm")
+            os.close(t1fd)
+            os.close(t2fd)
+
+            log("Writing WAST module to '%s'" % wast_tempfile)
+            file(wast_tempfile, 'w').write(form)
+            log("Compiling WASM to '%s'" % wasm_tempfile)
+            cmd = [ opts.wast2wasm,
+                    "--no-check",
+                    wast_tempfile,
+                    "-o",
+                    wasm_tempfile ]
+            log("Running: %s" % " ".join(cmd))
+            subprocess.check_call(cmd)
+
+            log("Starting interpreter for module '%s'" % wasm_tempfile)
+            cmd = [opts.interpreter, "--repl", wasm_tempfile]
+            log("Running: %s" % " ".join(cmd))
+            r = Runner(cmd, no_pty=opts.no_pty)
+
+            # Wait for the initial prompt
+            try:
+                assert_prompt(r, ['webassembly> '], opts.start_timeout)
+            except:
+                _, exc, _ = sys.exc_info()
+                log("\nException: %s" % repr(exc))
+                log("Output before exception:\n%s" % r.buf)
+                sys.exit(1)
+
+        elif skip_test(form, skips):
+            log("Skipping test: %s" % form[0:70])
+        elif re.match("^\(assert_return\\b.*", form):
+            if not is_ascii(form):
+                log("Skipping assert_return with non-ASCII chars: %s" % form[0:60])
+                continue
+            log("%s" % repr(form))
+            test_assert_return(r, opts, form)
+        elif re.match("^\(assert_trap\\b.*", form):
+            log("%s" % form)
+            test_assert_trap(r, opts, form)
+        elif re.match("^\(invoke\\b.*", form):
+            do_invoke(r, opts, form)
+        elif re.match("^\(assert_invalid\\b.*", form):
+            #log("ignoring assert_invalid")
+            pass
+        else:
+            raise Exception("unrecognized form '%s...'" % form[0:40])
+    cleanup_tempfiles(opts, [wast_tempfile, wasm_tempfile])
