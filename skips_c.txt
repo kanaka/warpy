@@ -23,6 +23,7 @@ invoke.*i64\.const -.*
 f64.const -?0x[0-9.]*p-1022
 f64.const -?0x1.921fb54442d18p\+2
 f64.const 0x1.6a09e667f3bcdp-1
+invoke.*min.*f64.const -0x0p\+0.*f64.const 0x0p\+0
 
 # float_misc.wast
 f64.const -?0x[01]\.[0-9a-f]+p-[0-9][0-9][0-9]+

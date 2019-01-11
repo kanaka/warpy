@@ -1857,21 +1857,25 @@ def interpret_mvp(module,
             elif 0xa4 == opcode: # f64.min
                 if a[2] < b[2]:
                     res = (F64, 0, a[2])
-                elif b[2] == 0.0:
-                    if str(a[2])[0] == '-':
-                        res = (F64, 0, a[2])
-                    else:
-                        res = (F64, 0, b[2])
+# Adding the 0.0 checks causes this error during compilation:
+#   File "/opt/pypy/rpython/jit/codewriter/assembler.py", line 230, in check_result
+#       assert self.count_regs['int'] + len(self.constants_i) <= 256
+
+#                elif b[2] == 0.0:
+#                    if str(a[2])[0] == '-':
+#                        res = (F64, 0, a[2])
+#                    else:
+#                        res = (F64, 0, b[2])
                 else:
                     res = (F64, 0, b[2])
             elif 0xa5 == opcode: # f64.max
                 if a[2] > b[2]:
                     res = (F64, 0, a[2])
-                elif b[2] == 0.0:
-                    if str(a[2])[0] == '-':
-                        res = (F64, 0, b[2])
-                    else:
-                        res = (F64, 0, a[2])
+#                elif b[2] == 0.0:
+#                    if str(a[2])[0] == '-':
+#                        res = (F64, 0, b[2])
+#                    else:
+#                        res = (F64, 0, a[2])
                 else:
                     res = (F64, 0, b[2])
             elif 0xa6 == opcode: # f64.copysign
