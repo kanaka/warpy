@@ -2522,6 +2522,7 @@ class Module():
 
         # Check arg type
         tparams = self.function[fidx].type.params
+        assert len(tparams) == len(args), "arg count mismatch %s != %s" % (len(tparams), len(args))
         for idx, arg in enumerate(args):
             assert tparams[idx] == arg[0], "arg type mismatch %s != %s" % (tparams[idx], arg[0])
             self.sp += 1
@@ -2639,7 +2640,6 @@ def env_read_file(mem, args):
 
 def import_function(module, field, mem, args):
     fname = "%s.%s" % (module, field)
-#    return [(I32, 378, 0.0)]
     if fname in ["spectest.print", "spectest.print_i32"]:
         return spectest_print(mem, args)
     elif fname == "env.fputs":
@@ -2663,10 +2663,13 @@ def parse_command(module, args):
         run_args.append(parse_number(tparams[idx], arg))
     return fname, run_args
 
+def usage(argv):
+    print("%s [--repl] [--argv] [--memory-pages PAGES] WASM [ARGS...]" % argv[0])
 
 ######################################
 # Entry points
 ######################################
+
 
 def entry_point(argv):
     try:
@@ -2681,7 +2684,10 @@ def entry_point(argv):
         while idx < len(argv):
             arg = argv[idx]
             idx += 1
-            if arg == "--repl":
+            if arg == "--help":
+                usage(argv)
+                return 1
+            elif arg == "--repl":
                 repl = True
             elif arg == "--argv":
                 argv_mode = True
@@ -2691,6 +2697,10 @@ def entry_point(argv):
                 idx += 1
             elif arg == "--":
                 continue
+            elif arg.startswith('--'):
+                print("Unknown option '%s'" % arg)
+                usage(argv)
+                return 2
             else:
                 args.append(arg)
         wasm = open(args[0]).read()
@@ -2705,7 +2715,6 @@ def entry_point(argv):
             # store at the beginning of memory. This must be before
             # the module is initialized so that we can properly set
             # the memoryBase global before it is imported.
-            fname = "_main"
             args.insert(0, argv[0])
             string_next = (len(args) + 1) * 4
             for i, arg in enumerate(args):
@@ -2717,18 +2726,30 @@ def entry_point(argv):
             string_next += (8 - (string_next % 8))
             IMPORT_VALUES['env.memoryBase'] = (I32, string_next, 0.0)
 
-            run_args = [(I32, len(args), 0.0), (I32, 0, 0.0)]
 
         m = Module(wasm, import_value, import_function, mem)
+
+        if argv_mode:
+            fname = "_main"
+            fidx = m.export_map[fname].index
+            arg_count = len(m.function[fidx].type.params)
+            if arg_count == 2:
+                run_args = [(I32, len(args), 0.0), (I32, 0, 0.0)]
+            elif arg_count == 0:
+                run_args = []
+            else:
+                raise Exception("_main has %s args, should have 0 or 2" %
+                        arg_count)
+        else:
+            # Convert args to expected numeric type. This must be
+            # after the module is initialized so that we know what
+            # types the arguments are
+            fname, run_args = parse_command(m, args)
 
         if '__post_instantiate' in m.export_map:
             m.run('__post_instantiate', [])
 
         if not repl:
-            # Convert args to expected numeric type. This must be
-            # after the module is initialized so that we know what
-            # types the arguments are
-            fname, run_args = parse_command(m, args)
 
             # Invoke one function and exit
             try:
