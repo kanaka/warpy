@@ -8,7 +8,7 @@ DEBUG = False   # verbose logging
 #DEBUG = True    # verbose logging
 VALIDATE= True
 
-import sys, os, math
+import sys, os, math, time
 IS_RPYTHON = sys.argv[0].endswith('rpython')
 
 sys.path.append(os.path.abspath('./pypy2-v5.6.0-src'))
@@ -151,6 +151,11 @@ class FunctionImport(Code):
         self.type = type  # value_type
         self.module = module
         self.field = field
+        fname = "%s.%s" % (module, field)
+        if not fname in ["spectest.print", "spectest.print_i32",
+                "env.fputs", "env.readline", "env.read_file",
+                "env.get_time_ms", "env.exit"]:
+            raise Exception("function import %s not found" % (fname))
 
 
 ######################################
@@ -2637,6 +2642,9 @@ def env_read_file(mem, args):
     slen = put_string(mem, buf, content)
     return [(I32, slen, 0.0)]
 
+def env_get_time_ms(mem, args):
+    return [(I32, int(time.time()), 0.0)]
+
 
 def import_function(module, field, mem, args):
     fname = "%s.%s" % (module, field)
@@ -2648,6 +2656,10 @@ def import_function(module, field, mem, args):
         return env_readline(mem, args)
     elif fname == "env.read_file":
         return env_read_file(mem, args)
+    elif fname == "env.get_time_ms":
+        return env_get_time_ms(mem, args)
+    elif fname == "env.exit":
+        raise Exception("env.exit called")
     else:
         raise Exception("function import %s not found" % (fname))
 
