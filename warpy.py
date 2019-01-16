@@ -2643,7 +2643,7 @@ def env_read_file(mem, args):
     return [(I32, slen, 0.0)]
 
 def env_get_time_ms(mem, args):
-    return [(I32, int(time.time()), 0.0)]
+    return [(I64, int(time.time()*1000), 0.0)]
 
 
 def import_function(module, field, mem, args):
