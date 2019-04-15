@@ -153,7 +153,7 @@ class FunctionImport(Code):
         self.field = field
         fname = "%s.%s" % (module, field)
         if not fname in ["spectest.print", "spectest.print_i32",
-                "env.fputs", "env.readline", "env.read_file",
+                "env.printline", "env.readline", "env.read_file",
                 "env.get_time_ms", "env.exit"]:
             raise Exception("function import %s not found" % (fname))
 
@@ -413,36 +413,36 @@ OPERATOR_INFO = {
         0xa6 : ['f64.copysign',   ''],
 
         # Conversions
-        0xa7 : ['i32.wrap/i64',        ''],
-        0xa8 : ['i32.trunc_s/f32',     ''],
-        0xa9 : ['i32.trunc_u/f32',     ''],
-        0xaa : ['i32.trunc_s/f64',     ''],
-        0xab : ['i32.trunc_u/f64',     ''],
+        0xa7 : ['i32.wrap_i64',        ''],
+        0xa8 : ['i32.trunc_f32_s',     ''],
+        0xa9 : ['i32.trunc_f32_u',     ''],
+        0xaa : ['i32.trunc_f64_s',     ''],
+        0xab : ['i32.trunc_f64_u',     ''],
 
-        0xac : ['i64.extend_s/i32',    ''],
-        0xad : ['i64.extend_u/i32',    ''],
-        0xae : ['i64.trunc_s/f32',     ''],
-        0xaf : ['i64.trunc_u/f32',     ''],
-        0xb0 : ['i64.trunc_s/f64',     ''],
-        0xb1 : ['i64.trunc_u/f64',     ''],
+        0xac : ['i64.extend_i32_s',    ''],
+        0xad : ['i64.extend_i32_u',    ''],
+        0xae : ['i64.trunc_f32_s',     ''],
+        0xaf : ['i64.trunc_f32_u',     ''],
+        0xb0 : ['i64.trunc_f64_s',     ''],
+        0xb1 : ['i64.trunc_f64_u',     ''],
 
-        0xb2 : ['f32.convert_s/i32',   ''],
-        0xb3 : ['f32.convert_u/i32',   ''],
-        0xb4 : ['f32.convert_s/i64',   ''],
-        0xb5 : ['f32.convert_u/i64',   ''],
-        0xb6 : ['f32.demote/f64',      ''],
+        0xb2 : ['f32.convert_i32_s',   ''],
+        0xb3 : ['f32.convert_i32_u',   ''],
+        0xb4 : ['f32.convert_i64_s',   ''],
+        0xb5 : ['f32.convert_i64_u',   ''],
+        0xb6 : ['f32.demote_f64',      ''],
 
-        0xb7 : ['f64.convert_s/i32',   ''],
-        0xb8 : ['f64.convert_u/i32',   ''],
-        0xb9 : ['f64.convert_s/i64',   ''],
-        0xba : ['f64.convert_u/i64',   ''],
-        0xbb : ['f64.promote/f32',     ''],
+        0xb7 : ['f64.convert_i32_s',   ''],
+        0xb8 : ['f64.convert_i32_u',   ''],
+        0xb9 : ['f64.convert_i64_s',   ''],
+        0xba : ['f64.convert_i64_u',   ''],
+        0xbb : ['f64.promote_f32',     ''],
 
         # Reinterpretations
-        0xbc : ['i32.reinterpret/f32', ''],
-        0xbd : ['i64.reinterpret/f64', ''],
-        0xbe : ['f32.reinterpret/i32', ''],
-        0xbf : ['f64.reinterpret/i64', ''],
+        0xbc : ['i32.reinterpret_f32', ''],
+        0xbd : ['i64.reinterpret_f64', ''],
+        0xbe : ['f32.reinterpret_i32', ''],
+        0xbf : ['f64.reinterpret_i64', ''],
         }
 
 LOAD_SIZE = { 0x28 : 4,
@@ -1903,10 +1903,10 @@ def interpret_mvp(module,
             sp -= 1
 
             # conversion operations
-            if   0xa7 == opcode: # i32.wrap/i64
+            if   0xa7 == opcode: # i32.wrap_i64
                 if VALIDATE: assert a[0] == I64
                 res = (I32, int2int32(a[1]), 0.0)
-            elif 0xa8 == opcode: # i32.trunc_s/f32
+            elif 0xa8 == opcode: # i32.trunc_f32_s
                 if VALIDATE: assert a[0] == F32
                 if math.isnan(a[2]):
                     raise WAException("invalid conversion to integer")
@@ -1915,7 +1915,7 @@ def interpret_mvp(module,
                 elif a[2] < -2147483648.0:
                     raise WAException("integer overflow")
                 res = (I32, int(a[2]), 0.0)
-#            elif 0xa9 == opcode: # i32.trunc_u/f32
+#            elif 0xa9 == opcode: # i32.trunc_f32_u
 #                if VALIDATE: assert a[0] == F32
 #                if math.isnan(a[2]):
 #                    raise WAException("invalid conversion to integer")
@@ -1924,7 +1924,7 @@ def interpret_mvp(module,
 #                elif a[2] <= -1.0:
 #                    raise WAException("integer overflow")
 #                res = (I32, int(a[2]), 0.0)
-#            elif 0xaa == opcode: # i32.trunc_s/f64
+#            elif 0xaa == opcode: # i32.trunc_f64_s
 #                if VALIDATE: assert a[0] == F64
 #                if math.isnan(a[2]):
 #                    raise WAException("invalid conversion to integer")
@@ -1933,7 +1933,7 @@ def interpret_mvp(module,
 #                elif a[2] < -2**31:
 #                    raise WAException("integer overflow")
 #                res = (I32, int(a[2]), 0.0)
-#            elif 0xab == opcode: # i32.trunc_u/f64
+#            elif 0xab == opcode: # i32.trunc_f64_u
 #                if VALIDATE: assert a[0] == F64
 #                debug("*** a[2]: %s" % a[2])
 #                if math.isnan(a[2]):
@@ -1943,13 +1943,13 @@ def interpret_mvp(module,
 #                elif a[2] <= -1.0:
 #                    raise WAException("integer overflow")
 #                res = (I32, int(a[2]), 0.0)
-            elif 0xac == opcode: # i64.extend_s/i32
+            elif 0xac == opcode: # i64.extend_i32_s
                 if VALIDATE: assert a[0] == I32
                 res = (I64, int2int32(a[1]), 0.0)
-            elif 0xad == opcode: # i64.extend_u/i32
+            elif 0xad == opcode: # i64.extend_i32_u
                 if VALIDATE: assert a[0] == I32
                 res = (I64, intmask(a[1]), 0.0)
-#            elif 0xae == opcode: # i64.trunc_s/f32
+#            elif 0xae == opcode: # i64.trunc_f32_s
 #                if VALIDATE: assert a[0] == F32
 #                if math.isnan(a[2]):
 #                    raise WAException("invalid conversion to integer")
@@ -1958,7 +1958,7 @@ def interpret_mvp(module,
 #                elif a[2] < -2**63:
 #                    raise WAException("integer overflow")
 #                res = (I64, int(a[2]), 0.0)
-#            elif 0xaf == opcode: # i64.trunc_u/f32
+#            elif 0xaf == opcode: # i64.trunc_f32_u
 #                if VALIDATE: assert a[0] == F32
 #                if math.isnan(a[2]):
 #                    raise WAException("invalid conversion to integer")
@@ -1967,7 +1967,7 @@ def interpret_mvp(module,
 #                elif a[2] <= -1.0:
 #                    raise WAException("integer overflow")
 #                res = (I64, int(a[2]), 0.0)
-            elif 0xb0 == opcode: # i64.trunc_s/f64
+            elif 0xb0 == opcode: # i64.trunc_f64_s
                 if VALIDATE: assert a[0] == F64
                 if math.isnan(a[2]):
                     raise WAException("invalid conversion to integer")
@@ -1976,7 +1976,7 @@ def interpret_mvp(module,
 #                elif a[2] < -2**63:
 #                    raise WAException("integer overflow")
                 res = (I64, int(a[2]), 0.0)
-            elif 0xb1 == opcode: # i64.trunc_u/f64
+            elif 0xb1 == opcode: # i64.trunc_f64_u
                 if VALIDATE: assert a[0] == F64
                 if math.isnan(a[2]):
                     raise WAException("invalid conversion to integer")
@@ -1985,34 +1985,34 @@ def interpret_mvp(module,
                 elif a[2] <= -1.0:
                     raise WAException("integer overflow")
                 res = (I64, int(a[2]), 0.0)
-            elif 0xb2 == opcode: # f32.convert_s/i32
+            elif 0xb2 == opcode: # f32.convert_i32_s
                 if VALIDATE: assert a[0] == I32
                 res = (F32, 0, float(a[1]))
-            elif 0xb3 == opcode: # f32.convert_u/i32
+            elif 0xb3 == opcode: # f32.convert_i32_u
                 if VALIDATE: assert a[0] == I32
                 res = (F32, 0, float(int2uint32(a[1])))
-            elif 0xb4 == opcode: # f32.convert_s/i64
+            elif 0xb4 == opcode: # f32.convert_i64_s
                 if VALIDATE: assert a[0] == I64
                 res = (F32, 0, float(a[1]))
-            elif 0xb5 == opcode: # f32.convert_u/i64
+            elif 0xb5 == opcode: # f32.convert_i64_u
                 if VALIDATE: assert a[0] == I64
                 res = (F32, 0, float(int2uint64(a[1])))
-#            elif 0xb6 == opcode: # f32.demote/f64
+#            elif 0xb6 == opcode: # f32.demote_f64
 #                if VALIDATE: assert a[0] == F64
 #                res = (F32, 0, unpack_f32(pack_f32(a[2])))
-            elif 0xb7 == opcode: # f64.convert_s/i32
+            elif 0xb7 == opcode: # f64.convert_i32_s
                 if VALIDATE: assert a[0] == I32
                 res = (F64, 0, float(a[1]))
-            elif 0xb8 == opcode: # f64.convert_u/i32
+            elif 0xb8 == opcode: # f64.convert_i32_u
                 if VALIDATE: assert a[0] == I32
                 res = (F64, 0, float(int2uint32(a[1])))
-            elif 0xb9 == opcode: # f64.convert_s/i64
+            elif 0xb9 == opcode: # f64.convert_i64_s
                 if VALIDATE: assert a[0] == I64
                 res = (F64, 0, float(a[1]))
-            elif 0xba == opcode: # f64.convert_u/i64
+            elif 0xba == opcode: # f64.convert_i64_u
                 if VALIDATE: assert a[0] == I64
                 res = (F64, 0, float(int2uint64(a[1])))
-            elif 0xbb == opcode: # f64.promote/f32
+            elif 0xbb == opcode: # f64.promote_f32
                 if VALIDATE: assert a[0] == F32
                 res = (F64, 0, a[2])
             else:
@@ -2029,16 +2029,16 @@ def interpret_mvp(module,
             a = stack[sp]
             sp -= 1
 
-            if   0xbc == opcode: # i32.reinterpret/f32
+            if   0xbc == opcode: # i32.reinterpret_f32
                 if VALIDATE: assert a[0] == F32
                 res = (I32, intmask(pack_f32(a[2])), 0.0)
-            elif 0xbd == opcode: # i64.reinterpret/f64
+            elif 0xbd == opcode: # i64.reinterpret_f64
                 if VALIDATE: assert a[0] == F64
                 res = (I64, intmask(pack_f64(a[2])), 0.0)
-#            elif 0xbe == opcode: # f32.reinterpret/i32
+#            elif 0xbe == opcode: # f32.reinterpret_i32
 #                if VALIDATE: assert a[0] == I32
 #                res = (F32, 0, unpack_f32(int2int32(a[1])))
-            elif 0xbf == opcode: # f64.reinterpret/i64
+            elif 0xbf == opcode: # f64.reinterpret_i64
                 if VALIDATE: assert a[0] == I64
                 res = (F64, 0, unpack_f64(int2int64(a[1])))
             else:
@@ -2592,8 +2592,7 @@ def put_string(mem, addr, str):
 
 IMPORT_VALUES = {
     "spectest.global_i32": (I32, 666, 666.6),
-    "env.memoryBase":      (I32, 0, 0.0),
-    "env.stdout":          (I32, 0, 0.0)
+    "env.memoryBase":      (I32, 0, 0.0)
 }
 
 def import_value(module, field):
@@ -2616,7 +2615,7 @@ def spectest_print(mem, args):
     print("%s '%s'" % (value_repr(args[0]), res))
     return []
 
-def env_fputs(mem, args):
+def env_printline(mem, args):
     os.write(1, get_string(mem, args[0][1]))
     return [(I32, 1, 1.0)]
 
@@ -2652,8 +2651,8 @@ def import_function(module, field, mem, args):
     fname = "%s.%s" % (module, field)
     if fname in ["spectest.print", "spectest.print_i32"]:
         return spectest_print(mem, args)
-    elif fname == "env.fputs":
-        return env_fputs(mem, args)
+    elif fname == "env.printline":
+        return env_printline(mem, args)
     elif fname == "env.readline":
         return env_readline(mem, args)
     elif fname == "env.read_file":

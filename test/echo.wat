@@ -1,6 +1,6 @@
 (module $echo
 
-  (import "env" "fputs" (func $fputs (param i32 i32)))
+  (import "env" "printline" (func $printline (param i32)))
   (import "env" "readline" (func $readline (param i32 i32 i32) (result i32)))
 
   (memory $mem (export "memory") 16)
@@ -17,18 +17,18 @@
     (local $res i32)
 
     (loop $repl_loop
-      (set_local $res
+      (local.set $res
         (call $readline (i32.const 0) ;; prompt string
-                        (get_global $line) ;; line buffer
-                        (get_global $line_max)))
-      (if (i32.ne (get_local $res) (i32.const 0))
+                        (global.get $line) ;; line buffer
+                        (global.get $line_max)))
+      (if (i32.ne (local.get $res) (i32.const 0))
         (then
-          (call $fputs (i32.const 10) (i32.const 0)) ;; line: 
-          (call $fputs (get_global $line) (i32.const 0))
-          (call $fputs (i32.const 17) (i32.const 0)) ;; \n
+          (call $printline (i32.const 10)) ;; line: 
+          (call $printline (global.get $line))
+          (call $printline (i32.const 17)) ;; \n
           (br $repl_loop))))
 
     (i32.const 0))
 
-  (export "main" (func $main))
+  (export "_main" (func $main))
 )
