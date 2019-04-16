@@ -105,6 +105,10 @@ class WAException(Exception):
     def __init__(self, message):
         self.message = message
 
+class ExitException(Exception):
+    def __init__(self, code):
+        self.code = code
+
 class Type():
     def __init__(self, index, form, params, results):
         self.index = index
@@ -2660,7 +2664,7 @@ def import_function(module, field, mem, args):
     elif fname == "env.get_time_ms":
         return env_get_time_ms(mem, args)
     elif fname == "env.exit":
-        raise Exception("env.exit called")
+        raise ExitException(args[0][1])
     else:
         raise Exception("function import %s not found" % (fname))
 
@@ -2796,6 +2800,8 @@ def entry_point(argv):
         else:
             os.write(2, "".join(traceback.format_exception(*sys.exc_info())))
             os.write(2, "Exception: %s\n" % e.message)
+    except ExitException as e:
+        return e.code
     except Exception as e:
         if IS_RPYTHON:
             llop.debug_print_traceback(lltype.Void)
